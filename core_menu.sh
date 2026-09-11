@@ -8,12 +8,14 @@
 
 # --- Capture credentials ---
 # Support both methods: env vars (improved) and args (legacy)
+# NOTE: use dedicated variable names (not USER/PASS) to avoid shadowing the
+# shell's standard $USER environment variable, which other tooling may rely on.
 if [ -n "$XUIONE_USER" ] && [ -n "$XUIONE_PASS" ]; then
-    USER="$XUIONE_USER"
-    PASS="$XUIONE_PASS"
+    XUI_AUTH_USER="$XUIONE_USER"
+    XUI_AUTH_PASS="$XUIONE_PASS"
 elif [ -n "$1" ] && [ -n "$2" ]; then
-    USER="$1"
-    PASS="$2"
+    XUI_AUTH_USER="$1"
+    XUI_AUTH_PASS="$2"
 else
     echo "ERROR: No credentials provided."
     exit 1
@@ -21,8 +23,16 @@ fi
 
 BASE_URL="tealc.pw/stuff/xuione/new"
 
+# --- MariaDB target ---
+# XUI.ONE 1.5.13 is most stable on the MariaDB 10.5 series (backup/restore in the
+# panel misbehaves when the installer is left to pick 10.3 or 10.6). We install and
+# hold a pinned 10.5 version. MARIADB_SERIES is what we verify/accept (major.minor);
+# MARIADB_VERSION is the exact archive.mariadb.org release used for the repo/pin.
+MARIADB_SERIES="10.5"
+MARIADB_VERSION="10.5.27"
+
 # Re-validate for security
-VALIDATE=$(wget -qO- --user="$USER" --password="$PASS" --user-agent="Mozilla/5.0" "https://$BASE_URL/test_user_pass" 2>/dev/null)
+VALIDATE=$(wget -qO- --user="$XUI_AUTH_USER" --password="$XUI_AUTH_PASS" --user-agent="Mozilla/5.0" "https://$BASE_URL/test_user_pass" 2>/dev/null)
 if [[ "$VALIDATE" != *"ok"* ]]; then
     echo "Security Violation: Unauthorized access."
     exit 1
@@ -52,9 +62,9 @@ detect_os() {
     echo "Detected OS: $OS_ID $OS_VERSION ($OS_CODENAME)"
 }
 
-# Map Ubuntu version to MariaDB 10.6 compatible codename
-# MariaDB 10.6 only has official repos up to jammy (22.04)
-# For newer Ubuntu, we use the jammy repo (works with lib fixes)
+# Map Ubuntu version to a MariaDB archive codename
+# The MariaDB archive repos only publish up to jammy (22.04); for newer Ubuntu
+# we fall back to the jammy repo (works together with the lib fixes above).
 get_mariadb_codename() {
     case "$OS_VERSION" in
         14.04) echo "trusty" ;;
@@ -467,11 +477,11 @@ SSLEOF
 }
 
 # ============================================================
-# FORCE MARIADB 10.6
+# FORCE MARIADB (pinned series - see MARIADB_SERIES / MARIADB_VERSION)
 # ============================================================
 
-force_mariadb_106() {
-    echo "--- Ensuring MariaDB 10.6 ---"
+force_mariadb() {
+    echo "--- Ensuring MariaDB $MARIADB_SERIES (target $MARIADB_VERSION) ---"
 
     NEED_INSTALL=true
 
@@ -479,10 +489,10 @@ force_mariadb_106() {
     if command -v mariadb &>/dev/null || command -v mysql &>/dev/null; then
         INSTALLED_VER=$(mysql -V 2>/dev/null | grep -oP 'Distrib \K[0-9]+\.[0-9]+' || echo "unknown")
         echo "Currently installed MariaDB/MySQL version: $INSTALLED_VER"
-        if [[ "$INSTALLED_VER" == "10.6" ]]; then
+        if [[ "$INSTALLED_VER" == "$MARIADB_SERIES" ]]; then
             NEED_INSTALL=false
         else
-            echo "Version $INSTALLED_VER detected. Replacing with MariaDB 10.6..."
+            echo "Version $INSTALLED_VER detected. Replacing with MariaDB $MARIADB_SERIES..."
             sudo systemctl stop mariadb 2>/dev/null
             sudo systemctl stop mysql 2>/dev/null
             # Unhold before removing (in case they were held from a previous run)
@@ -493,9 +503,9 @@ force_mariadb_106() {
     fi
 
     if $NEED_INSTALL; then
-        # Add MariaDB 10.6 repo
+        # Add MariaDB repo
         MARIA_CODENAME=$(get_mariadb_codename)
-        echo "Using MariaDB 10.6 repo with codename: $MARIA_CODENAME"
+        echo "Using MariaDB $MARIADB_VERSION repo with codename: $MARIA_CODENAME"
 
         # Import MariaDB signing key
         sudo apt-get install -y apt-transport-https curl gnupg 2>/dev/null
@@ -503,15 +513,17 @@ force_mariadb_106() {
         curl -fsSL https://mariadb.org/mariadb_release_signing_key.pgp | sudo gpg --dearmor --yes -o /etc/apt/keyrings/mariadb-keyring.gpg 2>/dev/null
 
         # Add repository - using archive.mariadb.org (dlm.mariadb.com returns 404)
-        MARIADB_REPO="https://archive.mariadb.org/mariadb-10.6.22/repo/ubuntu"
+        MARIADB_REPO="https://archive.mariadb.org/mariadb-${MARIADB_VERSION}/repo/ubuntu"
         echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/mariadb-keyring.gpg] $MARIADB_REPO $MARIA_CODENAME main" | \
-            sudo tee /etc/apt/sources.list.d/mariadb-10.6.list
+            sudo tee /etc/apt/sources.list.d/mariadb.list
 
-        # Remove old preferences file without .pref extension (APT ignores it)
-        sudo rm -f /etc/apt/preferences.d/mariadb-10.6
+        # Remove legacy repo/preferences files left by older tool versions (e.g. 10.6)
+        sudo rm -f /etc/apt/preferences.d/mariadb-10.6 \
+                   /etc/apt/preferences.d/mariadb-10.6.pref \
+                   /etc/apt/sources.list.d/mariadb-10.6.list
 
-        # Pin MariaDB 10.6 to prevent repo-level upgrades
-        cat <<PINEOF | sudo tee /etc/apt/preferences.d/mariadb-10.6.pref
+        # Pin MariaDB to archive.mariadb.org to prevent repo-level upgrades
+        cat <<PINEOF | sudo tee /etc/apt/preferences.d/mariadb.pref
 Package: mariadb-*
 Pin: origin archive.mariadb.org
 Pin-Priority: 1000
@@ -530,8 +542,8 @@ PINEOF
 
         # Verify install
         FINAL_VER=$(mysql -V 2>/dev/null | grep -oP 'Distrib \K[0-9]+\.[0-9]+' || echo "failed")
-        if [[ "$FINAL_VER" != "10.6" ]]; then
-            echo "WARNING: MariaDB installation may have issues. Detected: $FINAL_VER"
+        if [[ "$FINAL_VER" != "$MARIADB_SERIES" ]]; then
+            echo "WARNING: MariaDB installation may have issues. Expected $MARIADB_SERIES, detected: $FINAL_VER"
             return 1
         fi
     fi
@@ -547,7 +559,7 @@ PINEOF
     # Summary
     echo ""
     echo "=========================================="
-    echo " MariaDB 10.6 - Status"
+    echo " MariaDB $MARIADB_SERIES - Status"
     echo "=========================================="
     echo " Version:  $(mysql -V 2>/dev/null | grep -oP 'Distrib \K[0-9.]+' || echo 'N/A')"
     if $NEED_INSTALL; then
@@ -574,13 +586,17 @@ install_xui() {
     detect_os
     echo "Detected OS: $OS_ID $OS_VERSION ($OS_CODENAME)"
 
-    if [[ "$OS_VERSION" == "20.04" ]]; then
+    # Callers that already ran fix_compatibility + force_mariadb (e.g. run_full_setup)
+    # pass "skip-fixes" so we don't do the whole compatibility/MariaDB pass twice.
+    if [[ "$1" == "skip-fixes" ]]; then
+        echo "Pre-install compatibility/MariaDB already handled by caller - skipping."
+    elif [[ "$OS_VERSION" == "20.04" ]]; then
         # Ubuntu 20.04: XUI.ONE installer handles everything natively, no fixes needed
         echo "Ubuntu 20.04 detected - no compatibility fixes required."
     else
-        # Ubuntu 22.04+ needs compatibility fixes and our MariaDB 10.6
+        # Ubuntu 22.04+ needs compatibility fixes and our pinned MariaDB series
         fix_compatibility
-        force_mariadb_106
+        force_mariadb
     fi
 
     read -p "Press [Enter] to start XUI installation..."
@@ -606,7 +622,7 @@ install_xui() {
     fi
 
     echo "Downloading XUI_1.5.13.zip..."
-    wget --user="$USER" --password="$PASS" --user-agent="Mozilla/5.0" \
+    wget --user="$XUI_AUTH_USER" --password="$XUI_AUTH_PASS" --user-agent="Mozilla/5.0" \
         "https://$BASE_URL/XUI_1.5.13.zip" -O XUI_1.5.13.zip
 
     if [ ! -f XUI_1.5.13.zip ]; then
@@ -650,7 +666,7 @@ install_xui() {
 
     # Hold MariaDB/MySQL packages to prevent accidental upgrades
     # On Ubuntu 20.04 the original installer installs MariaDB, so we hold those packages
-    # On Ubuntu 22/24 force_mariadb_106 already does this
+    # On Ubuntu 22/24 force_mariadb already does this
     if [[ "$OS_VERSION" == "20.04" ]]; then
         echo ""
         echo "--- Holding MariaDB/MySQL packages ---"
@@ -708,7 +724,7 @@ install_xui() {
 
 apply_patch() {
     echo "--- Applying License Removal Patch ---"
-    bash <(wget -qO- --user="$USER" --password="$PASS" --user-agent="Mozilla/5.0" "https://$BASE_URL/patch.sh")
+    bash <(wget -qO- --user="$XUI_AUTH_USER" --password="$XUI_AUTH_PASS" --user-agent="Mozilla/5.0" "https://$BASE_URL/patch.sh")
 }
 
 # ============================================================
@@ -737,8 +753,6 @@ optimize_server() {
     read -p "Select role: " ROLE
 
     if [ "$ROLE" == "3" ]; then return; fi
-
-    MYSQL_CNF="/etc/mysql/my.cnf"
 
     if [ "$ROLE" == "1" ]; then
         # MAIN server: 70% RAM for InnoDB
@@ -772,36 +786,69 @@ optimize_server() {
     echo "  innodb_write_io_threads    = $WRITE_THREADS"
     echo "  thread_pool_size           = $THREAD_POOL"
     echo ""
-    read -p "Apply these changes to $MYSQL_CNF? (y/n): " APPLY
+    read -p "Apply this tuning now? (y/n): " APPLY
 
-    if [[ "$APPLY" == "y" || "$APPLY" == "Y" ]]; then
-        # Backup current config
-        sudo cp "$MYSQL_CNF" "${MYSQL_CNF}.bak.$(date +%Y%m%d%H%M%S)"
-
-        # Apply changes using sed
-        if [ -f "$MYSQL_CNF" ]; then
-            sudo sed -i "s/^innodb_buffer_pool_size.*/innodb_buffer_pool_size         = ${BUFF}G/" "$MYSQL_CNF"
-            sudo sed -i "s/^innodb_buffer_pool_instances.*/innodb_buffer_pool_instances    = $POOL_INSTANCES/" "$MYSQL_CNF"
-            sudo sed -i "s/^innodb_io_capacity.*/innodb_io_capacity              = $IO_CAP/" "$MYSQL_CNF"
-            sudo sed -i "s/^innodb_read_io_threads.*/innodb_read_io_threads          = $READ_THREADS/" "$MYSQL_CNF"
-            sudo sed -i "s/^innodb_write_io_threads.*/innodb_write_io_threads         = $WRITE_THREADS/" "$MYSQL_CNF"
-            sudo sed -i "s/^thread_pool_size.*/thread_pool_size                = $THREAD_POOL/" "$MYSQL_CNF"
-
-            # Add innodb_io_capacity_max if not present
-            if ! grep -q "innodb_io_capacity_max" "$MYSQL_CNF"; then
-                sudo sed -i "/innodb_io_capacity /a innodb_io_capacity_max          = $IO_CAP_MAX" "$MYSQL_CNF"
-            else
-                sudo sed -i "s/^innodb_io_capacity_max.*/innodb_io_capacity_max          = $IO_CAP_MAX/" "$MYSQL_CNF"
-            fi
-
-            echo "Configuration applied. Restarting MariaDB..."
-            sudo systemctl restart mariadb 2>/dev/null || sudo service mariadb restart 2>/dev/null
-            echo "Done."
-        else
-            echo "ERROR: $MYSQL_CNF not found!"
-        fi
-    else
+    if [[ "$APPLY" != "y" && "$APPLY" != "Y" ]]; then
         echo "Skipped."
+    else
+        # Write a dedicated drop-in instead of editing my.cnf in place.
+        # Editing my.cnf with sed only works if each key already exists at the
+        # start of a line. On XUI installs the InnoDB settings usually live in an
+        # included mariadb.conf.d/*.cnf, so the old sed approach silently changed
+        # NOTHING (buffer pool never updated). A 99- drop-in is read last by
+        # MariaDB and reliably overrides any earlier value.
+        if [ -d /etc/mysql/mariadb.conf.d ]; then
+            TUNING_DIR="/etc/mysql/mariadb.conf.d"
+        elif [ -d /etc/mysql/conf.d ]; then
+            TUNING_DIR="/etc/mysql/conf.d"
+        else
+            TUNING_DIR="/etc/mysql/mariadb.conf.d"
+            sudo mkdir -p "$TUNING_DIR"
+        fi
+        TUNING_FILE="$TUNING_DIR/99-xui-tuning.cnf"
+
+        # Backup an existing drop-in before overwriting
+        [ -f "$TUNING_FILE" ] && sudo cp "$TUNING_FILE" "${TUNING_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+
+        sudo tee "$TUNING_FILE" > /dev/null <<TUNEOF
+# XUI Multi-Tool hardware tuning (role $ROLE) - generated $(date '+%Y-%m-%d %H:%M:%S')
+[mysqld]
+innodb_buffer_pool_size         = ${BUFF}G
+innodb_buffer_pool_instances    = $POOL_INSTANCES
+innodb_io_capacity              = $IO_CAP
+innodb_io_capacity_max          = $IO_CAP_MAX
+innodb_read_io_threads          = $READ_THREADS
+innodb_write_io_threads         = $WRITE_THREADS
+thread_pool_size                = $THREAD_POOL
+TUNEOF
+        echo "Tuning written to $TUNING_FILE"
+
+        echo "Restarting MariaDB..."
+        if sudo systemctl restart mariadb 2>/dev/null || sudo service mariadb restart 2>/dev/null; then
+            sleep 2
+            if systemctl is-active mariadb &>/dev/null || pgrep -x mariadbd >/dev/null || pgrep -x mysqld >/dev/null; then
+                # Validate the values actually took effect (best-effort; needs root auth)
+                ACTUAL_BUFF=$(mysql -u root -N -e "SELECT ROUND(@@innodb_buffer_pool_size/1024/1024/1024,2);" 2>/dev/null)
+                ACTUAL_INST=$(mysql -u root -N -e "SELECT @@innodb_buffer_pool_instances;" 2>/dev/null)
+                echo ""
+                echo "Live values after restart:"
+                echo "  innodb_buffer_pool_size      = ${ACTUAL_BUFF:-?} G (requested ${BUFF}G)"
+                echo "  innodb_buffer_pool_instances = ${ACTUAL_INST:-?} (requested $POOL_INSTANCES)"
+                if [ -n "$ACTUAL_BUFF" ] && [ "${ACTUAL_BUFF%.*}" -ge 1 ] 2>/dev/null; then
+                    echo "Tuning verified."
+                else
+                    echo "NOTE: Could not confirm via SQL (root password required?)."
+                    echo "      Check manually: SHOW VARIABLES LIKE 'innodb_buffer_pool_size';"
+                fi
+            else
+                echo "ERROR: MariaDB did not come back up after restart!"
+                echo "The tuning may be invalid. Inspect: journalctl -u mariadb -n 50"
+                echo "Revert with: sudo rm $TUNING_FILE && sudo systemctl restart mariadb"
+            fi
+        else
+            echo "ERROR: MariaDB restart failed. Tuning written but not active."
+            echo "Inspect: journalctl -u mariadb -n 50"
+        fi
     fi
 
     # Kernel TCP optimization (sysctl)
@@ -832,53 +879,94 @@ secure_mysql() {
 
     sudo apt-get install -y iptables-persistent 2>/dev/null
 
+    # Detect whether an IPv6 firewall is usable (some hosts disable IPv6 entirely).
+    # Without this, port 3306 would stay wide open over IPv6 while we lock down IPv4.
+    HAS_IP6=0
+    if command -v ip6tables &>/dev/null && sudo ip6tables -L -n &>/dev/null; then
+        HAS_IP6=1
+    fi
+
     # Flush any existing MySQL rules to start clean
     echo "Flushing existing MySQL firewall rules..."
     sudo iptables -D INPUT -p tcp --dport 3306 -j DROP 2>/dev/null
     sudo iptables -F MYSQL_BRUTE 2>/dev/null
     sudo iptables -X MYSQL_BRUTE 2>/dev/null
+    if [ "$HAS_IP6" -eq 1 ]; then
+        sudo ip6tables -D INPUT -p tcp --dport 3306 -j DROP 2>/dev/null
+        sudo ip6tables -F MYSQL_BRUTE 2>/dev/null
+        sudo ip6tables -X MYSQL_BRUTE 2>/dev/null
+    fi
 
     # 1. Allow established connections (first)
     sudo iptables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
         sudo iptables -I INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    if [ "$HAS_IP6" -eq 1 ]; then
+        sudo ip6tables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+            sudo ip6tables -I INPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    fi
 
     # 2. Always allow localhost
     sudo iptables -A INPUT -p tcp --dport 3306 -s 127.0.0.1 -j ACCEPT
+    [ "$HAS_IP6" -eq 1 ] && sudo ip6tables -A INPUT -p tcp --dport 3306 -s ::1 -j ACCEPT
 
-    # 3. Create brute-force protection chain
+    # 3. Create brute-force protection chain (separate recent list per family)
     sudo iptables -N MYSQL_BRUTE 2>/dev/null
     sudo iptables -F MYSQL_BRUTE
     sudo iptables -A MYSQL_BRUTE -m recent --name mysqlbf --rttl --update --seconds 60 --hitcount 3 -j DROP
     sudo iptables -A MYSQL_BRUTE -m recent --name mysqlbf --set -j ACCEPT
+    if [ "$HAS_IP6" -eq 1 ]; then
+        sudo ip6tables -N MYSQL_BRUTE 2>/dev/null
+        sudo ip6tables -F MYSQL_BRUTE
+        sudo ip6tables -A MYSQL_BRUTE -m recent --name mysqlbf6 --rttl --update --seconds 60 --hitcount 3 -j DROP
+        sudo ip6tables -A MYSQL_BRUTE -m recent --name mysqlbf6 --set -j ACCEPT
+    fi
 
     # 4. Authorize additional IPs
     echo ""
-    echo "Enter IPs to authorize for MySQL access (one per line)."
+    echo "Enter IPs to authorize for MySQL access (IPv4 or IPv6, one per line)."
     echo "Press Enter with empty input to finish."
     while true; do
         read -p "  Authorize IP: " AUTH_IP
         [ -z "$AUTH_IP" ] && break
-        # Validate IP format (basic)
+        # Validate IP format (basic) and route to the matching firewall family
         if [[ "$AUTH_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
             sudo iptables -A INPUT -p tcp --dport 3306 -s "$AUTH_IP" -j ACCEPT
-            echo "  -> $AUTH_IP authorized"
+            echo "  -> $AUTH_IP authorized (IPv4)"
+        elif [[ "$AUTH_IP" == *:* ]]; then
+            if [ "$HAS_IP6" -eq 1 ]; then
+                sudo ip6tables -A INPUT -p tcp --dport 3306 -s "$AUTH_IP" -j ACCEPT
+                echo "  -> $AUTH_IP authorized (IPv6)"
+            else
+                echo "  -> IPv6 firewall unavailable on this host; skipped $AUTH_IP"
+            fi
         else
-            echo "  -> Invalid IP format: $AUTH_IP (use x.x.x.x or x.x.x.x/xx)"
+            echo "  -> Invalid IP format: $AUTH_IP (use x.x.x.x, x.x.x.x/xx or an IPv6 address)"
         fi
     done
 
     # 5. Route new connections through brute-force check
     sudo iptables -A INPUT -p tcp --dport 3306 --syn -j MYSQL_BRUTE
+    [ "$HAS_IP6" -eq 1 ] && sudo ip6tables -A INPUT -p tcp --dport 3306 --syn -j MYSQL_BRUTE
 
     # 6. Drop everything else (last rule)
     sudo iptables -A INPUT -p tcp --dport 3306 -j DROP
+    [ "$HAS_IP6" -eq 1 ] && sudo ip6tables -A INPUT -p tcp --dport 3306 -j DROP
 
-    # Save
-    sudo netfilter-persistent save 2>/dev/null || sudo iptables-save | sudo tee /etc/iptables/rules.v4 >/dev/null
+    # Save (both families)
+    if ! sudo netfilter-persistent save 2>/dev/null; then
+        sudo mkdir -p /etc/iptables
+        sudo iptables-save | sudo tee /etc/iptables/rules.v4 >/dev/null
+        [ "$HAS_IP6" -eq 1 ] && sudo ip6tables-save | sudo tee /etc/iptables/rules.v6 >/dev/null
+    fi
 
     echo ""
-    echo "MySQL firewall rules applied:"
+    echo "MySQL firewall rules applied (IPv4):"
     sudo iptables -L INPUT -n --line-numbers | grep -E "3306|MYSQL"
+    if [ "$HAS_IP6" -eq 1 ]; then
+        echo ""
+        echo "MySQL firewall rules applied (IPv6):"
+        sudo ip6tables -L INPUT -n --line-numbers | grep -E "3306|MYSQL"
+    fi
     echo ""
     echo "--- MySQL secured ---"
 }
@@ -1552,22 +1640,30 @@ fix_ubuntu_24() {
     detect_os
     fix_compatibility
     echo ""
-    echo "If you need to install MariaDB 10.6 on this LB, run option 8."
+    echo "If you need to install MariaDB $MARIADB_SERIES on this LB, use Installation > Install MariaDB."
 }
 
 # ============================================================
-# STANDALONE MARIADB 10.6 INSTALL
+# STANDALONE MARIADB INSTALL
 # ============================================================
 
-install_mariadb_106() {
+install_mariadb() {
     detect_os
     fix_compatibility
-    force_mariadb_106
+    force_mariadb
 }
 
 # ============================================================
 # IMPORT DATABASE
 # ============================================================
+
+# mariadb-dump (10.6.17+/11.x) prepends a "sandbox mode" header comment whose
+# \- token makes the mysql client abort on import. Remove ONLY that exact comment
+# line, so any legitimate \- inside data/strings is left untouched.
+# Reads stdin, writes stdout (use in a pipe, or with `strip_dump_sandbox < file`).
+strip_dump_sandbox() {
+    sed '/^\/\*M!999999\\- enable the sandbox mode \*\//d'
+}
 
 import_database() {
     echo "=========================================="
@@ -1851,21 +1947,20 @@ import_database() {
     echo "Importing database... (this may take a while)"
     IMPORT_START=$(date +%s)
 
-    # MariaDB 10.6.22+ dumps contain \- sequences (sandbox mode comment on line 1,
-    # and potentially in data/comments elsewhere). The mysql client interprets \- as
-    # an unknown command and aborts. We strip ALL \- globally with sed before piping.
-    # This is safe: \- is not a valid SQL escape, so the data is unchanged.
+    # Strip the mariadb-dump "sandbox mode" header comment (see strip_dump_sandbox)
+    # before piping to the mysql client. We remove only that one comment line, not
+    # every \- in the file, so real data is preserved.
     if [[ "$FILE_TYPE" == "gzip" ]]; then
         if command -v pv &>/dev/null; then
-            pv "$DB_FILE" | gunzip | sed 's/\\-/-/g' | mysql -u root $MYSQL_EXTRA "$DB_NAME"
+            pv "$DB_FILE" | gunzip | strip_dump_sandbox | mysql -u root $MYSQL_EXTRA "$DB_NAME"
         else
-            gunzip -c "$DB_FILE" | sed 's/\\-/-/g' | mysql -u root $MYSQL_EXTRA "$DB_NAME"
+            gunzip -c "$DB_FILE" | strip_dump_sandbox | mysql -u root $MYSQL_EXTRA "$DB_NAME"
         fi
     else
         if command -v pv &>/dev/null; then
-            pv "$DB_FILE" | sed 's/\\-/-/g' | mysql -u root $MYSQL_EXTRA "$DB_NAME"
+            pv "$DB_FILE" | strip_dump_sandbox | mysql -u root $MYSQL_EXTRA "$DB_NAME"
         else
-            sed 's/\\-/-/g' "$DB_FILE" | mysql -u root $MYSQL_EXTRA "$DB_NAME"
+            strip_dump_sandbox < "$DB_FILE" | mysql -u root $MYSQL_EXTRA "$DB_NAME"
         fi
     fi
 
@@ -1877,7 +1972,7 @@ import_database() {
         echo ""
         echo "ERROR: Import failed!"
         echo "Restoring backup..."
-        gunzip -c "$BACKUP_FILE" | sed 's/\\-/-/g' | mysql -u root $MYSQL_EXTRA "$DB_NAME" 2>/dev/null
+        gunzip -c "$BACKUP_FILE" | strip_dump_sandbox | mysql -u root $MYSQL_EXTRA "$DB_NAME" 2>/dev/null
         sudo systemctl start xuione 2>/dev/null
         [ -n "$MEGA_CLEANUP" ] && rm -rf "$MEGA_CLEANUP"
         return 1
@@ -1916,12 +2011,12 @@ import_database() {
     echo ""
     echo "Record counts:"
     mysql -u root $MYSQL_EXTRA -e "
-        SELECT 'streams' AS item, COUNT(*) AS count FROM $DB_NAME.streams
-        UNION ALL SELECT 'bouquets', COUNT(*) FROM $DB_NAME.bouquets
-        UNION ALL SELECT 'lines', COUNT(*) FROM $DB_NAME.lines
-        UNION ALL SELECT 'users', COUNT(*) FROM $DB_NAME.users
-        UNION ALL SELECT 'servers', COUNT(*) FROM $DB_NAME.servers
-        UNION ALL SELECT 'epg', COUNT(*) FROM $DB_NAME.epg;" 2>/dev/null
+        SELECT 'streams' AS item, COUNT(*) AS count FROM \`$DB_NAME\`.\`streams\`
+        UNION ALL SELECT 'bouquets', COUNT(*) FROM \`$DB_NAME\`.\`bouquets\`
+        UNION ALL SELECT 'lines', COUNT(*) FROM \`$DB_NAME\`.\`lines\`
+        UNION ALL SELECT 'users', COUNT(*) FROM \`$DB_NAME\`.\`users\`
+        UNION ALL SELECT 'servers', COUNT(*) FROM \`$DB_NAME\`.\`servers\`
+        UNION ALL SELECT 'epg', COUNT(*) FROM \`$DB_NAME\`.\`epg\`;" 2>/dev/null
 
     # 3. Table integrity check (mysqlcheck)
     echo ""
@@ -2104,17 +2199,6 @@ draw_option() {
     fi
 }
 
-draw_header() {
-    local text="$1"
-    local color="${2:-$Y}"
-    local clean_text=$(echo -e "$text" | sed 's/\x1b\[[0-9;]*m//g')
-    local len=${#clean_text}
-    local pad=$(( (48 - len) / 2 ))
-    local pad_r=$(( 48 - len - pad ))
-    echo -e "${D}  |${N}%${pad}s${color}${text}${N}%${pad_r}s${D}|${N}" | sed "s/%[0-9]*s/$(printf '%*s' $pad '')/;s/%[0-9]*s/$(printf '%*s' $pad_r '')/"
-    printf "${D}  |${N}%${pad}s${color}%s${N}%${pad_r}s${D}|${N}\n" "" "$text" ""
-}
-
 pause_return() {
     echo ""
     echo -e "  ${D}Press [Enter] to return...${N}"
@@ -2136,7 +2220,7 @@ show_banner() {
     echo -e "${D}  by ${M}@tealcavalon${D} | Improved Edition${N}"
     echo -e "${D}  ----------------------------------------${N}"
     echo ""
-    echo -e "  ${D}User:${N} ${G}$USER${N}  ${D}|${N}  ${D}OS:${N} ${G}Ubuntu $OS_VERSION${N} ${D}($OS_CODENAME)${N}"
+    echo -e "  ${D}User:${N} ${G}$XUI_AUTH_USER${N}  ${D}|${N}  ${D}OS:${N} ${G}Ubuntu $OS_VERSION${N} ${D}($OS_CODENAME)${N}"
     echo ""
 }
 
@@ -2187,7 +2271,7 @@ show_install_menu() {
         draw_empty
         draw_option "1" "Install XUI.ONE 1.5.13" "no patch needed"
         draw_empty
-        draw_option "2" "Install MariaDB 10.6" "force + hold"
+        draw_option "2" "Install MariaDB $MARIADB_SERIES" "force + hold"
         draw_empty
         draw_option "3" "Install Telegram BOT" "XUI Monitor"
         draw_empty
@@ -2201,7 +2285,7 @@ show_install_menu() {
 
         case $opt in
             1) install_xui ; pause_return ;;
-            2) install_mariadb_106 ; pause_return ;;
+            2) install_mariadb ; pause_return ;;
             3)
                 echo ""
                 echo -e "  ${C}XUI Monitor - Telegram BOT${N}"
@@ -2346,7 +2430,7 @@ show_info_menu() {
                     echo "$HELD" | while read p; do echo -e "    ${D}-${N} $p"; done
                 else
                     echo -e "  ${R}WARNING: No MariaDB packages on hold!${N}"
-                    echo -e "  ${D}Run Install > MariaDB 10.6 to fix this.${N}"
+                    echo -e "  ${D}Run Install > MariaDB $MARIADB_SERIES to fix this.${N}"
                 fi
                 pause_return
                 ;;
@@ -2373,7 +2457,7 @@ run_full_setup() {
     echo -e "  ${D}This will run the complete installation sequence:${N}"
     echo ""
     echo -e "  ${C}1.${N} Fix compatibility (if needed)"
-    echo -e "  ${C}2.${N} Install & lock MariaDB 10.6"
+    echo -e "  ${C}2.${N} Install & lock MariaDB $MARIADB_SERIES"
     echo -e "  ${C}3.${N} Install XUI.ONE 1.5.13"
     echo -e "  ${C}4.${N} Import database (optional)"
     echo -e "  ${C}5.${N} Optimize server hardware"
@@ -2394,14 +2478,14 @@ run_full_setup() {
     fix_compatibility
 
     echo ""
-    echo -e "  ${C}[2/6]${N} ${W}MariaDB 10.6...${N}"
+    echo -e "  ${C}[2/6]${N} ${W}MariaDB $MARIADB_SERIES...${N}"
     echo -e "  ${D}----------------------------------------------${N}"
-    force_mariadb_106
+    force_mariadb
 
     echo ""
     echo -e "  ${C}[3/6]${N} ${W}XUI.ONE 1.5.13...${N}"
     echo -e "  ${D}----------------------------------------------${N}"
-    install_xui
+    install_xui skip-fixes
 
     echo ""
     echo -e "  ${C}[4/6]${N} ${W}Database import...${N}"
