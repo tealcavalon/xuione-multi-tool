@@ -114,8 +114,10 @@ check_and_log() {
     # Build new log entry
     local new_entry="${now}|${date_str}|${ipv4}|${ipv6}|${status}|${hostname_str}|${os_str}"
 
-    # Check IP limit (only for logins that would be GRANTED)
-    if [ "$status" == "GRANTED" ]; then
+    # Check IP limit (only for GRANTED logins, and only when this server's public IP
+    # was actually determined). If IP lookup failed (both none), fail OPEN so a
+    # transient ifconfig.me/ipify outage can't wrongly lock out a legitimate user.
+    if [ "$status" == "GRANTED" ] && { [ "$ipv4" != "none" ] || [ "$ipv6" != "none" ]; }; then
         if [ "$source_count" -ge "$MAX_IPS_24H" ] && [ "$current_ip_registered" == "false" ]; then
             # BLOCKED — log it and show error
             new_entry="${now}|${date_str}|${ipv4}|${ipv6}|BLOCKED|${hostname_str}|${os_str}"
@@ -180,7 +182,7 @@ echo -e "  ${D}+-------------------------------------------------+${N}"
 echo ""
 echo -e "  ${D}Login to continue${N}"
 echo ""
-read -p "  $(echo -e "${C}  Username: ${N}")" AUTH_USER
+read -r -p "  $(echo -e "${C}  Username: ${N}")" AUTH_USER
 read -rs -p "  $(echo -e "${C}  Password: ${N}")" AUTH_PASS
 echo ""
 echo ""
@@ -197,6 +199,10 @@ if [[ "$TEST_RESULT" == *"ok"* ]]; then
     IP_RESULT=$(get_public_ip)
     PUBLIC_IPV4=$(echo "$IP_RESULT" | cut -d'|' -f1)
     PUBLIC_IPV6=$(echo "$IP_RESULT" | cut -d'|' -f2)
+
+    if [ "$PUBLIC_IPV4" == "none" ] && [ "$PUBLIC_IPV6" == "none" ]; then
+        echo -e "  ${Y}Note: could not determine this server's public IP; skipping the IP limit check.${N}"
+    fi
 
     # Check IP limit + log
     if ! check_and_log "$AUTH_USER" "$PUBLIC_IPV4" "$PUBLIC_IPV6" "GRANTED"; then
