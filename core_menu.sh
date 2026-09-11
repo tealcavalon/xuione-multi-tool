@@ -76,7 +76,10 @@ get_mariadb_codename() {
         21.10) echo "impish" ;;
         22.04) echo "jammy" ;;
         22.10) echo "kinetic" ;;
-        # Ubuntu 23.04+ and 24.04+ -> use jammy repo (last supported)
+        # Ubuntu 23.04+ / 24.04+ -> no dedicated archive repo, use jammy (last supported)
+        24.04) echo "jammy" ;;
+        24.10) echo "jammy" ;;
+        25.04) echo "jammy" ;;
         *) echo "jammy" ;;
     esac
 }
@@ -878,6 +881,11 @@ secure_mysql() {
     echo "--- Securing MySQL (port 3306) ---"
 
     sudo apt-get install -y iptables-persistent 2>/dev/null
+    if ! command -v netfilter-persistent &>/dev/null; then
+        echo "NOTE: netfilter-persistent is not available - rules will be written to"
+        echo "      /etc/iptables/rules.v4(.v6) as a fallback, but may not auto-restore"
+        echo "      on boot unless your system loads them. Verify persistence after reboot."
+    fi
 
     # Detect whether an IPv6 firewall is usable (some hosts disable IPv6 entirely).
     # Without this, port 3306 would stay wide open over IPv6 while we lock down IPv4.
@@ -1481,10 +1489,48 @@ recompile_nginx() {
         grep '"name"' | sed 's/.*"name": "\(.*\)",/\1/' | grep "^release-" | head -n 1)
     LATEST_VER=$(echo "$LATEST_TAG" | sed 's/release-//')
 
-    echo "Latest available:      $LATEST_VER (tag: $LATEST_TAG)"
+    # Guard: GitHub API can be unreachable or rate-limited. Don't proceed to build
+    # an empty "nginx-" tag - let the user supply a tag manually or abort.
+    if [ -z "$LATEST_TAG" ]; then
+        echo "WARNING: Could not fetch the nginx release list from GitHub"
+        echo "         (API unreachable or rate-limited)."
+        read -p "Enter an nginx release tag to build (e.g. release-1.28.0), empty to abort: " MANUAL_TAG
+        if [ -z "$MANUAL_TAG" ]; then
+            echo "Aborted."
+            return 1
+        fi
+        LATEST_TAG="$MANUAL_TAG"
+    else
+        echo "Latest available:      $LATEST_VER (tag: $LATEST_TAG)"
+    fi
+
+    # Let the user pin a specific stable tag instead of being forced onto the latest.
     echo ""
+    read -p "Release tag to build [$LATEST_TAG] (Enter to accept): " CHOSEN_TAG
+    [ -n "$CHOSEN_TAG" ] && LATEST_TAG="$CHOSEN_TAG"
+    # Accept either a bare version (1.28.0) or a full tag (release-1.28.0)
+    case "$LATEST_TAG" in
+        release-*) ;;
+        *) LATEST_TAG="release-$LATEST_TAG" ;;
+    esac
+    LATEST_VER=$(echo "$LATEST_TAG" | sed 's/release-//')
+
+    echo ""
+    echo "Will build: $LATEST_TAG  (current: $CURRENT_VER)"
     read -p "Proceed with recompilation? (y/n): " PROCEED
     [[ "$PROCEED" != "y" ]] && return
+
+    # Check free space in /tmp before building. A failed/half build that leaves the
+    # service stopped is far worse than refusing up front. Sources + objects for
+    # nginx + OpenSSL + PCRE + zlib need roughly 2.5 GB.
+    TMP_AVAIL_KB=$(df -Pk /tmp 2>/dev/null | awk 'NR==2{print $4}')
+    REQUIRED_KB=$((2500 * 1024))
+    if [ -n "$TMP_AVAIL_KB" ] && [ "$TMP_AVAIL_KB" -lt "$REQUIRED_KB" ] 2>/dev/null; then
+        echo "ERROR: Not enough free space in /tmp for the build."
+        echo "       Available: $((TMP_AVAIL_KB / 1024)) MB, need ~2500 MB."
+        echo "       Free up space and retry (XUI service was NOT stopped)."
+        return 1
+    fi
 
     OPENSSL_VERSION="3.3.2"
     PCRE_VERSION="8.45"
@@ -1497,7 +1543,11 @@ recompile_nginx() {
     sudo systemctl stop xuione 2>/dev/null
 
     echo "Installing build dependencies..."
-    sudo apt-get -y install build-essential git libssl-dev tar unzip curl
+    if ! sudo apt-get -y install build-essential git libssl-dev tar unzip curl; then
+        echo "ERROR: Failed to install build dependencies. Aborting build."
+        sudo systemctl start xuione 2>/dev/null
+        return 1
+    fi
 
     # Download sources
     echo "Downloading nginx $LATEST_TAG..."
