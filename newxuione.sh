@@ -5,7 +5,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the loader/toolkit itself, NOT the XUI.ONE version).
 # Shown in the banner before login so users can tell they are on the latest build.
-MULTITOOL_VERSION="1.1.0"
+MULTITOOL_VERSION="1.2.0"
 
 # Colors
 R='\033[0;31m'

@@ -25,7 +25,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.1.0"
+MULTITOOL_VERSION="1.2.0"
 
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 is most stable on the MariaDB 10.5 series (backup/restore in the
@@ -2453,6 +2453,71 @@ fix_archive_cleanup() {
     fi
 }
 
+# --- FIX: SSL / certbot (core subset ported from xui_monitor) ---
+# Finds certbot across XUI layouts, shows the certificate nginx actually serves
+# (read from ssl.conf), and offers a dry-run or a real renew + nginx reload.
+# The bot's full lineage management (issue/delete/sync across servers) is not
+# ported - this is the day-to-day renewal path.
+fix_ssl() {
+    if ! check_xui_installed >/dev/null 2>&1; then check_xui_installed; return; fi
+    local SSLCONF="/home/xui/bin/nginx/conf/ssl.conf"
+
+    local CB="" CFG="" p d
+    for p in /home/xui/bin/certbot-auto /home/xui/bin/certbot/certbot-auto \
+             /home/xui/bin/certbot/bin/certbot /home/xui/bin/certbot/certbot \
+             "$(command -v certbot 2>/dev/null)"; do
+        [ -n "$p" ] && [ -x "$p" ] && CB="$p" && break
+    done
+    for d in /home/xui/bin/certbot/config /home/xui/certbot/config /etc/letsencrypt; do
+        [ -d "$d/live" ] && CFG="$d" && break
+    done
+    [ -z "$CFG" ] && for d in /home/xui/bin/certbot/config /etc/letsencrypt; do
+        [ -d "$d" ] && CFG="$d" && break
+    done
+    if [ -z "$CB" ]; then
+        echo "  -> certbot not found under /home/xui/bin or PATH."
+        echo "     Run 'Fix Compatibility' (installs a certbot wrapper) or 'apt install certbot' first."
+        return
+    fi
+    local CF=""
+    [ -n "$CFG" ] && CF="--config-dir $CFG"
+    echo "  -> certbot:    $CB"
+    echo "  -> config dir: ${CFG:-<none>}"
+
+    local served="" certfile=""
+    if sudo test -f "$SSLCONF"; then
+        certfile=$(sudo grep -oP 'ssl_certificate\s+\K[^;]+' "$SSLCONF" 2>/dev/null | head -1 | tr -d ' ')
+        served=$(echo "$certfile" | grep -oP '/live/\K[^/]+' | head -1)
+    fi
+    echo "  -> nginx serves: ${served:-<unknown>}"
+    if [ -n "$certfile" ] && sudo test -f "$certfile"; then
+        echo "  -> expires:      $(sudo openssl x509 -enddate -noout -in "$certfile" 2>/dev/null | cut -d= -f2)"
+    fi
+
+    echo ""
+    echo "  1) Dry-run renew (test, no changes)"
+    echo "  2) Renew now + reload nginx"
+    echo "  3) Cancel"
+    read -p "  $(echo -e "${C}Select: ${N}")" s
+    case "$s" in
+        1) sudo "$CB" renew $CF --dry-run ;;
+        2)
+            fix_brief "Renew SSL certificate(s)" \
+                "Runs 'certbot renew' for the panel's certificates and reloads nginx." \
+                "Expired certificates break the panel and player TLS; renewal keeps them valid." \
+                "Low - certbot only replaces certs that are due; nginx is reloaded, not restarted." \
+                "certbot versions each lineage; the previous one stays in ${CFG:-the config dir}." || { echo "  Cancelled."; return; }
+            sudo "$CB" renew $CF
+            if sudo /home/xui/bin/nginx/sbin/nginx -s reload 2>/dev/null; then
+                echo "  -> nginx reloaded."
+            else
+                echo "  -> NOTE: reload nginx manually (sudo /home/xui/bin/nginx/sbin/nginx -s reload)."
+            fi
+            ;;
+        *) echo "  Cancelled." ;;
+    esac
+}
+
 # ============================================================
 # STATUS / DIAGNOSTICS
 # ============================================================
@@ -2733,6 +2798,8 @@ show_tools_menu() {
         draw_empty
         draw_option "14" "Archive cleanup" "timeshift .offset"
         draw_empty
+        draw_option "15" "SSL / certbot" "renew + reload"
+        draw_empty
         draw_line
         draw_empty
         draw_option "B" "Back to Main Menu"
@@ -2756,6 +2823,7 @@ show_tools_menu() {
             12) fix_yabs ; pause_return ;;
             13) fix_series_repair ; pause_return ;;
             14) fix_archive_cleanup ; pause_return ;;
+            15) fix_ssl ; pause_return ;;
             b|B) return ;;
             *) ;;
         esac
