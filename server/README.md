@@ -83,6 +83,21 @@ files so the loader can fetch it:
   account id) at run time and passes them to the updater via environment — the
   key is never stored in the repo.
 
+## ffmpeg build (for the Tools > Build ffmpeg 4.4 fix)
+
+The `Build ffmpeg 4.4` option compiles ffmpeg 4.4.5 from source into the panel's
+4.4 slot. It downloads the exact build recipe (from xui_monitor) and picks the
+right variant by the panel's `segment_type`:
+
+- Upload `server/ffbuild_seg0.sh` and `server/ffbuild_seg1.sh` to
+  `https://tealc.pw/stuff/xuione/new/` (same directory as `core_menu.sh`).
+- `seg0` = panels set to `-f hls`; `seg1` = panels set to `-f segment` (adds
+  XUI's `+live+delete` patch). The toolkit reads `xui.settings.segment_type`
+  and fetches the matching file automatically.
+- The build keeps the previous slot binary as `.orig` (and a non-running build
+  as `.broken`) and installs only after the binary verifies and passes the
+  panel's own live command check.
+
 ## After deploying — decommission the FTP logging
 
 The old FTP account is no longer used by the loader. Because its password was

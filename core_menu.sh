@@ -25,7 +25,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.3.0"
+MULTITOOL_VERSION="1.4.0"
 
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 is most stable on the MariaDB 10.5 series (backup/restore in the
@@ -2568,6 +2568,67 @@ fix_maxmind() {
     [ "$rc" -eq 0 ] && echo "  -> MaxMind databases updated." || echo "  -> Updater exited with code $rc (see output above)."
 }
 
+# --- FIX: compile ffmpeg into the panel's 4.4 slot ---
+# Runs the exact build recipe from xui_monitor (ffbuild_seg0/1.sh), which
+# compiles ffmpeg 4.4.5 with XUI's feature set, verifies it runs, checks it
+# against the panel's own live command, and only then installs it - keeping the
+# old binary as .orig (and a non-running one as .broken). The build script is
+# chosen by the panel's segment_type (0=hls, 1=segment, which needs the
+# +live+delete patch). Deploy: upload server/ffbuild_seg0.sh and
+# server/ffbuild_seg1.sh next to core_menu.sh.
+fix_ffmpeg_build() {
+    if ! check_xui_installed >/dev/null 2>&1; then check_xui_installed; return; fi
+
+    local SEG
+    SEG=$(sudo mysql -N -e "SELECT segment_type FROM xui.settings LIMIT 1;" 2>/dev/null | tr -cd '01' | head -c1)
+    if [ "$SEG" != "0" ] && [ "$SEG" != "1" ]; then
+        echo "  -> Could not read xui.settings.segment_type (need root MySQL). Aborting."
+        return
+    fi
+    if [ "$SEG" = "1" ]; then
+        echo "  -> Panel segment_type: 1 (-f segment; the build gets XUI's +live+delete patch)"
+    else
+        echo "  -> Panel segment_type: 0 (-f hls; stock flags)"
+    fi
+
+    fix_brief "Compile ffmpeg 4.4.5 -> 4.4 slot" \
+        "Compiles ffmpeg 4.4.5 from source with XUI's feature set and installs it into the panel's 4.4 slot." \
+        "XUI's shipped static ffmpeg dies on glibc 2.34+ (Ubuntu 22.04+); a from-source build restores streaming." \
+        "HIGH - replaces the panel's ffmpeg binary and takes ~30 min. The old binary is kept as .orig; a build that will not run is kept as .broken and NOT installed." \
+        "Yes - copy /home/xui/bin/ffmpeg_bin/4.4/<bin>.orig back over <bin>." || { echo "  Cancelled."; return; }
+
+    local D="/root/xui_ffbuild"
+    sudo mkdir -p "$D"
+    printf '%s' "$SEG" | sudo tee "$D/segtype" >/dev/null
+
+    echo "  -> Downloading the build recipe (ffbuild_seg${SEG}.sh)..."
+    if ! sudo wget -qO "$D/build.sh" --user="$XUI_AUTH_USER" --password="$XUI_AUTH_PASS" \
+            --user-agent="Mozilla/5.0" "https://$BASE_URL/ffbuild_seg${SEG}.sh" || ! sudo test -s "$D/build.sh"; then
+        echo "  -> Could not download ffbuild_seg${SEG}.sh."
+        echo "     Upload server/ffbuild_seg0.sh and ffbuild_seg1.sh to https://$BASE_URL/ ."
+        return
+    fi
+    sudo chmod 0755 "$D/build.sh"
+
+    echo "  -> Building (this takes ~30 minutes). Live log below (Ctrl-C stops watching, not the build):"
+    printf '' | sudo tee "$D/build.log" >/dev/null
+    sudo bash "$D/build.sh" &
+    local BPID=$!
+    sudo tail -f "$D/build.log" &
+    local TPID=$!
+    wait "$BPID"; local rc=$?
+    sleep 1; sudo kill "$TPID" 2>/dev/null
+
+    echo ""
+    echo "  -> Final state: $(sudo tail -1 "$D/state" 2>/dev/null)"
+    if [ "$rc" -eq 0 ]; then
+        echo "  -> Slot 4.4 now: $(/home/xui/bin/ffmpeg_bin/4.4/ffmpeg -version 2>/dev/null | head -1)"
+    else
+        echo "  -> Build did not complete (exit $rc). See $D/build.log; reasons:"
+        sudo tail -5 "$D/why" 2>/dev/null
+    fi
+}
+
 # ============================================================
 # STATUS / DIAGNOSTICS
 # ============================================================
@@ -2852,6 +2913,8 @@ show_tools_menu() {
         draw_empty
         draw_option "16" "MaxMind GeoIP" "update databases"
         draw_empty
+        draw_option "17" "Build ffmpeg 4.4" "compile -> slot"
+        draw_empty
         draw_line
         draw_empty
         draw_option "B" "Back to Main Menu"
@@ -2877,6 +2940,7 @@ show_tools_menu() {
             14) fix_archive_cleanup ; pause_return ;;
             15) fix_ssl ; pause_return ;;
             16) fix_maxmind ; pause_return ;;
+            17) fix_ffmpeg_build ; pause_return ;;
             b|B) return ;;
             *) ;;
         esac
