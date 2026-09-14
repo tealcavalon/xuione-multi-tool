@@ -161,7 +161,8 @@ if ($lines === false) {
 // Parse existing entries: prune old ones and count distinct GRANTED sources
 // within the window. Format: ts|date|ip|client_v4|client_v6|status|hostname|os
 $kept          = [];
-$window_keys   = [];    // set of distinct source keys (GRANTED) in the last 24h
+$window_first  = [];    // first-seen ts per source (GRANTED) in the last 24h
+$window_last   = [];    // last-seen ts per source - governs when it clears
 $cur_in_window = false; // has this source already logged in the window?
 foreach ($lines as $line) {
     if ($line === '') {
@@ -179,7 +180,12 @@ foreach ($lines as $line) {
     if ($ts >= $cutoff_window && $row_status === 'GRANTED') {
         $k = source_key($row_ip);
         if ($k !== '') {
-            $window_keys[$k] = true;
+            if (!isset($window_first[$k]) || $ts < $window_first[$k]) {
+                $window_first[$k] = $ts;
+            }
+            if (!isset($window_last[$k]) || $ts > $window_last[$k]) {
+                $window_last[$k] = $ts;
+            }
             if ($k === $cur_key) {
                 $cur_in_window = true;
             }
@@ -192,7 +198,7 @@ foreach ($lines as $line) {
 // transient IP/proxy issue never wrongly locks out a legitimate user.
 $blocked = false;
 if ($status === 'GRANTED' && $cur_key !== '') {
-    if (!$cur_in_window && count($window_keys) >= MAX_SOURCES_24H) {
+    if (!$cur_in_window && count($window_last) >= MAX_SOURCES_24H) {
         $blocked = true;
         $status  = 'BLOCKED';
     }
@@ -223,8 +229,16 @@ if ($blocked) {
     echo "BLOCKED\n";
     echo 'max=' . MAX_SOURCES_24H . "\n";
     echo 'your_ip=' . $ip . "\n";
-    foreach (array_keys($window_keys) as $k) {
-        echo 'source=' . $k . "\n";
+    // Per source: when it was first registered, and how long until it clears
+    // (a source stops counting 24h after its most recent access).
+    // Format: source=<key>|<registered UTC>|<seconds until cleared>
+    foreach ($window_last as $k => $last_ts) {
+        $first_ts  = $window_first[$k] ?? $last_ts;
+        $clears_in = ($last_ts + WINDOW_SECONDS) - $now;
+        if ($clears_in < 0) {
+            $clears_in = 0;
+        }
+        echo 'source=' . $k . '|' . gmdate('Y-m-d H:i', $first_ts) . ' UTC|' . $clears_in . "\n";
     }
 } else {
     echo "GRANTED\n";

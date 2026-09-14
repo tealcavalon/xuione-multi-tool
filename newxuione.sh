@@ -97,8 +97,14 @@ if [[ "$TEST_RESULT" == *"ok"* ]]; then
         echo -e "  ${Y}servers/IPs in the last 24 hours.${N}"
         echo ""
         echo -e "  ${W}Currently registered sources:${N}"
-        echo "$ACCESS_RESULT" | sed -n 's/^source=/    - /p' | while read -r line; do
-            echo -e "  ${C}${line}${N}"
+        echo "$ACCESS_RESULT" | sed -n 's/^source=//p' | while IFS='|' read -r skey sreg sclear; do
+            if [[ "$sclear" =~ ^[0-9]+$ ]]; then
+                sh=$(( sclear / 3600 )); sm=$(( (sclear % 3600) / 60 ))
+                ctxt="clears in ${sh}h ${sm}m"
+            else
+                ctxt=""
+            fi
+            echo -e "    ${C}- ${skey}${N}  ${D}registered ${sreg}${N}${ctxt:+  ${Y}· ${ctxt}${N}}"
         done
         [ -n "$YOURIP" ] && echo -e "  ${D}Your IP: ${YOURIP}${N}"
         echo ""
