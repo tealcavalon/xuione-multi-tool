@@ -2335,6 +2335,124 @@ fix_yabs() {
     curl -sL yabs.sh | bash
 }
 
+# --- FIX: series repair (orphan episode rows) ---
+# Ported from xui_monitor/series_repair.py: delete rows in streams_episodes whose
+# stream was deleted. Dumps + verifies the table before the DELETE. Series that
+# would be emptied entirely are protected (kept) by default.
+fix_series_repair() {
+    if ! check_xui_installed >/dev/null 2>&1; then check_xui_installed; return; fi
+
+    echo ""
+    echo -e "  ${D}Scanning xui.streams_episodes for orphan rows...${N}"
+    local scan
+    scan=$(sudo mysql -N -e "
+        SELECT CONCAT('ORPHANS:', COUNT(*)) FROM xui.streams_episodes e LEFT JOIN xui.streams st ON st.id = e.stream_id WHERE st.id IS NULL;
+        SELECT CONCAT('TOTAL:', COUNT(*)) FROM xui.streams_episodes;
+        SELECT CONCAT('EMPTIED:', e.series_id, ':', COALESCE(s.title,'?'), ':', COUNT(*))
+          FROM xui.streams_episodes e
+          LEFT JOIN xui.streams st ON st.id = e.stream_id
+          LEFT JOIN xui.streams_series s ON s.id = e.series_id
+          GROUP BY e.series_id, s.title
+          HAVING SUM(st.id IS NULL) = COUNT(*) AND COUNT(*) > 0;" 2>&1)
+
+    local orphans total
+    orphans=$(echo "$scan" | sed -n 's/^ORPHANS://p' | head -1)
+    total=$(echo "$scan" | sed -n 's/^TOTAL://p' | head -1)
+    if ! [[ "$orphans" =~ ^[0-9]+$ ]]; then
+        echo -e "  ${R}Could not read the database (root MySQL access needed). Aborting.${N}"
+        return
+    fi
+    echo "  -> Orphan episode rows: ${orphans} of ${total:-?}"
+    [ "$orphans" -eq 0 ] && { echo "  -> Nothing to clean."; return; }
+
+    # Series that would be emptied entirely -> protected (kept) by default.
+    local protect_ids="" emptied_lines
+    emptied_lines=$(echo "$scan" | sed -n 's/^EMPTIED://p')
+    if [ -n "$emptied_lines" ]; then
+        echo -e "  ${Y}These series are ONLY dead rows and will be kept (protected):${N}"
+        while IFS=':' read -r sid title rows; do
+            [ -z "$sid" ] && continue
+            [[ "$sid" =~ ^[0-9]+$ ]] || continue
+            echo "     - [$sid] ${title} (${rows} rows)"
+            protect_ids="${protect_ids:+$protect_ids,}$sid"
+        done <<< "$emptied_lines"
+    fi
+
+    fix_brief "Series repair (orphan episodes)" \
+        "Deletes streams_episodes rows whose stream was deleted. Nothing playable is touched." \
+        "Orphan rows are invisible/unplayable and inflate duplicate counts across the panel." \
+        "Medium - a DELETE on part of the table; the table is dumped to /home/xui/backups and verified first." \
+        "Yes - restore the dumped .sql from /home/xui/backups." || { echo "  Cancelled."; return; }
+
+    sudo mkdir -p /home/xui/backups || { echo "  FAILED: cannot create /home/xui/backups."; return; }
+    local F="/home/xui/backups/streams_episodes_$(date +%Y%m%d_%H%M%S).sql"
+    if ! sudo mysqldump --single-transaction xui streams_episodes | sudo tee "$F" >/dev/null; then
+        echo "  FAILED: dump could not be written. Aborting (no delete)."
+        return
+    fi
+    if ! sudo grep -q 'INSERT INTO' "$F"; then
+        echo "  FAILED: dump has no data (empty safety net). Aborting (no delete)."
+        return
+    fi
+    echo "  -> Backup: $F"
+
+    local where_extra=""
+    [ -n "$protect_ids" ] && where_extra=" AND e.series_id NOT IN ($protect_ids)"
+    local out
+    out=$(sudo mysql -N xui -e "DELETE e FROM streams_episodes e LEFT JOIN streams st ON st.id = e.stream_id WHERE st.id IS NULL${where_extra}; SELECT CONCAT('DELETED:', ROW_COUNT());" 2>&1)
+    local deleted
+    deleted=$(echo "$out" | sed -n 's/^DELETED://p' | head -1)
+    if [[ "$deleted" =~ ^[0-9]+$ ]]; then
+        echo -e "  ${G}Done. Deleted ${deleted} orphan rows.${N} Backup kept at $F"
+    else
+        echo -e "  ${R}DELETE failed:${N}"; echo "$out" | tail -3
+        echo "  Table is unchanged / restore from $F if needed."
+    fi
+}
+
+# --- FIX: archive / timeshift cleanup ---
+# Ported from xui_monitor: disable XUI's own archive cleanup and delete the
+# .ts.offset markers (XUI counts each as a file against days*1440, so recorders
+# discard half the days they were told to keep). Recordings are NOT touched.
+fix_archive_cleanup() {
+    if ! check_xui_installed >/dev/null 2>&1; then check_xui_installed; return; fi
+
+    local APATH="/home/xui/content/archive"
+    [ -d "$APATH" ] || APATH="/home/xui/tv_archive"
+    if [ ! -d "$APATH" ]; then
+        echo "  -> No archive directory found (/home/xui/content/archive or /home/xui/tv_archive)."
+        return
+    fi
+    local offn
+    offn=$(sudo find "$APATH" -name '*.ts.offset' 2>/dev/null | wc -l)
+    echo "  -> Archive path: $APATH"
+    echo "  -> .ts.offset markers found: $offn"
+
+    fix_brief "Archive / timeshift cleanup" \
+        "Turns off XUI's own archive cleanup (settings.cleanup=0) and deletes the .ts.offset markers." \
+        "XUI counts each .ts.offset as a file against days*1440, so recorders discard half the days they should keep." \
+        "Medium - deletes .ts.offset MARKER files (not the recordings) and changes one panel setting." \
+        "settings.cleanup can be set back to 1; markers regenerate as new segments record." || { echo "  Cancelled."; return; }
+
+    sudo mysql -N -e "UPDATE xui.settings SET cleanup=0;" 2>&1
+    local cl
+    cl=$(sudo mysql -N -e "SELECT cleanup FROM xui.settings LIMIT 1;" 2>/dev/null)
+    if [ "$cl" = "0" ]; then
+        echo "  -> XUI archive cleanup disabled (settings.cleanup=0)."
+    else
+        echo "  -> WARNING: could not confirm settings.cleanup=0 (root MySQL needed)."
+    fi
+
+    if [ "$offn" -gt 0 ]; then
+        sudo find "$APATH" -name '*.ts.offset' -delete 2>/dev/null
+        local left
+        left=$(sudo find "$APATH" -name '*.ts.offset' 2>/dev/null | wc -l)
+        echo "  -> Removed $((offn - left)) .ts.offset markers ($left remaining)."
+    else
+        echo "  -> No .ts.offset markers to delete."
+    fi
+}
+
 # ============================================================
 # STATUS / DIAGNOSTICS
 # ============================================================
@@ -2611,6 +2729,10 @@ show_tools_menu() {
         draw_empty
         draw_option "12" "YABS benchmark" "CPU/disk/net"
         draw_empty
+        draw_option "13" "Series repair" "orphan episodes"
+        draw_empty
+        draw_option "14" "Archive cleanup" "timeshift .offset"
+        draw_empty
         draw_line
         draw_empty
         draw_option "B" "Back to Main Menu"
@@ -2632,6 +2754,8 @@ show_tools_menu() {
             10) fix_timesync ; pause_return ;;
             11) fix_apport ; pause_return ;;
             12) fix_yabs ; pause_return ;;
+            13) fix_series_repair ; pause_return ;;
+            14) fix_archive_cleanup ; pause_return ;;
             b|B) return ;;
             *) ;;
         esac
