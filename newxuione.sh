@@ -3,6 +3,10 @@
 # --- Configuration ---
 BASE_URL="tealc.pw/stuff/xuione/new"
 
+# Multi-Tool version (the loader/toolkit itself, NOT the XUI.ONE version).
+# Shown in the banner before login so users can tell they are on the latest build.
+MULTITOOL_VERSION="1.1.0"
+
 # Colors
 R='\033[0;31m'
 G='\033[0;32m'
@@ -60,6 +64,8 @@ echo -e "  ${D}+-------------------------------------------------+${N}"
 echo -e "  ${D}|${N}  ${W}M U L T I - T O O L${N}  ${D}v1.5.13${N}                  ${D}|${N}"
 echo -e "  ${D}|${N}  ${D}by${N} ${M}@tealcavalon${N}  ${D}|${N}  ${D}t.me/tealcavalon${N}        ${D}|${N}"
 echo -e "  ${D}+-------------------------------------------------+${N}"
+echo ""
+echo -e "  ${W}Multi-Tool version: ${G}v${MULTITOOL_VERSION}${N}   ${D}(for XUI.ONE 1.5.13)${N}"
 echo ""
 echo -e "  ${D}Login to continue${N}"
 echo ""
