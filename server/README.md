@@ -71,6 +71,18 @@ curl ... -H 'X-Forwarded-For: 1.1.1.9' ...   # -> GRANTED
 Check that `logs/<user>.log` is created and appended, and is **not** downloadable:
 `curl -u USER:PASS https://.../log_access.php/../logs/<user>.log` should be denied.
 
+## MaxMind updater (for the Tools > MaxMind GeoIP fix)
+
+The `MaxMind GeoIP` option in the toolkit downloads and runs `maxmind_updater.dat`
+(it does an mmdb schema conversion that bash cannot). Upload it next to the other
+files so the loader can fetch it:
+
+- Upload `server/maxmind_updater.dat` to `https://tealc.pw/stuff/xuione/new/maxmind_updater.dat`
+  (same Basic-auth directory as `core_menu.sh`).
+- The toolkit asks the operator for their MaxMind license key (and optional
+  account id) at run time and passes them to the updater via environment — the
+  key is never stored in the repo.
+
 ## After deploying — decommission the FTP logging
 
 The old FTP account is no longer used by the loader. Because its password was

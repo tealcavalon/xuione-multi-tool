@@ -25,7 +25,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.2.0"
+MULTITOOL_VERSION="1.3.0"
 
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 is most stable on the MariaDB 10.5 series (backup/restore in the
@@ -2518,6 +2518,56 @@ fix_ssl() {
     esac
 }
 
+# --- FIX: MaxMind GeoIP databases (runs the Python updater) ---
+# The DB refresh needs an mmdb schema conversion (GeoLite2-ASN -> GeoIP2-ISP)
+# that only the Python updater does, so this downloads and runs the same
+# maxmind_updater.dat the bot uses rather than reimplementing it in bash.
+# Deploy: upload server/maxmind_updater.dat to https://<BASE_URL>/maxmind_updater.dat.
+fix_maxmind() {
+    if ! check_xui_installed >/dev/null 2>&1; then check_xui_installed; return; fi
+
+    fix_brief "MaxMind GeoIP update" \
+        "Downloads current GeoLite2 databases (Country/City/ASN->ISP) and installs them into the panel's GeoIP paths." \
+        "XUI's geo features (per-country rules, ISP labels) go stale without periodic MaxMind refreshes." \
+        "Low - the updater verifies each database before replacing the live one and keeps the previous set." \
+        "Yes - the previous databases are kept by the updater." || { echo "  Cancelled."; return; }
+
+    command -v python3 >/dev/null 2>&1 || sudo apt-get install -y python3 2>/dev/null
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "  -> python3 is required and could not be installed. Aborting."
+        return
+    fi
+
+    local KEY ACCT
+    read -rs -p "  $(echo -e "${C}MaxMind license key: ${N}")" KEY; echo ""
+    [ -z "$KEY" ] && { echo "  -> No license key given. Aborting."; return; }
+    read -p "  $(echo -e "${C}MaxMind account id (optional, Enter to skip): ${N}")" ACCT
+
+    local UPD="/tmp/maxmind_updater_$$.dat"
+    echo "  -> Downloading the updater..."
+    if ! wget -qO "$UPD" --user="$XUI_AUTH_USER" --password="$XUI_AUTH_PASS" \
+            --user-agent="Mozilla/5.0" "https://$BASE_URL/maxmind_updater.dat" || [ ! -s "$UPD" ]; then
+        echo "  -> Could not download maxmind_updater.dat."
+        echo "     Upload it to https://$BASE_URL/maxmind_updater.dat (see server/ in the repo)."
+        rm -f "$UPD"
+        return
+    fi
+
+    # Safety: refuse the legacy / DB-IP updater generations (mirrors the bot).
+    if ! grep -q -- '--check' "$UPD"; then
+        echo "  -> Refusing: legacy updater (no --check; would run destructively)."; rm -f "$UPD"; return
+    fi
+    if grep -q 'download.db-ip.com' "$UPD"; then
+        echo "  -> Refusing: DB-IP updater build (oversized databases)."; rm -f "$UPD"; return
+    fi
+
+    echo "  -> Running the updater (up to ~15 min)..."
+    sudo env MM_LICENSE_KEY="$KEY" MM_ACCOUNT_ID="$ACCT" python3 "$UPD"
+    local rc=$?
+    rm -f "$UPD"
+    [ "$rc" -eq 0 ] && echo "  -> MaxMind databases updated." || echo "  -> Updater exited with code $rc (see output above)."
+}
+
 # ============================================================
 # STATUS / DIAGNOSTICS
 # ============================================================
@@ -2800,6 +2850,8 @@ show_tools_menu() {
         draw_empty
         draw_option "15" "SSL / certbot" "renew + reload"
         draw_empty
+        draw_option "16" "MaxMind GeoIP" "update databases"
+        draw_empty
         draw_line
         draw_empty
         draw_option "B" "Back to Main Menu"
@@ -2824,6 +2876,7 @@ show_tools_menu() {
             13) fix_series_repair ; pause_return ;;
             14) fix_archive_cleanup ; pause_return ;;
             15) fix_ssl ; pause_return ;;
+            16) fix_maxmind ; pause_return ;;
             b|B) return ;;
             *) ;;
         esac

@@ -1,0 +1,766 @@
+#!/usr/bin/env python3
+"""MaxMind GeoIP updater — runs on the XUI ONE server via SSH or locally.
+
+Downloads the official MaxMind GeoLite2 databases (the same products XUI ONE
+ships with, hence the file names) and installs them into /home/xui/bin/maxmind.
+
+Why MaxMind and not DB-IP: XUI ONE's original GeoLite2-City.mmdb is ~70 MB.
+The DB-IP City Lite equivalent is ~125 MB because DB-IP splits the IP space
+into ~8M ranges (14.9M search-tree nodes) versus GeoLite2's ~4M — 79% of that
+file is the search tree, so it cannot be trimmed by dropping locales.
+
+GeoIP2-ISP.mmdb is commercial-only, so there is no free drop-in replacement.
+Writing a plain ASN database over it would break XUI: GeoIP2-ISP records carry
+four fields (isp, organization, autonomous_system_number,
+autonomous_system_organization) while GeoLite2-ASN carries only the last two,
+so the `isp` field XUI displays would vanish. Instead we download the free
+GeoLite2-ASN and re-emit it with database_type GeoIP2-ISP and all four fields,
+mapping isp/organization from the AS organisation. Coarser than the commercial
+data (~82k organisations vs ~13.7M records) but fresh, and every field XUI
+reads still resolves. The original commercial file is snapshotted once to
+GeoIP2-ISP.mmdb.orig so it is never lost to backup rotation.
+
+Credentials (env vars):
+    MM_LICENSE_KEY   required — MaxMind license key
+    MM_ACCOUNT_ID    optional — enables the current basic-auth permalink API;
+                     without it the legacy license-key URL is used.
+
+Modes:
+    (default)   download + install
+    --check     HEAD only: report whether a newer build exists. Does not count
+                against the MaxMind daily download limit.
+"""
+import os, sys, re, json, gzip, time, tarfile, tempfile, shutil, struct, socket, bisect
+import csv, ipaddress, urllib.request, urllib.error, urllib.parse, base64
+from datetime import datetime, timezone
+
+# Bumped whenever this script's behaviour or output markers change. The bot
+# greps the file for this string before executing it: the pre-2.0 updater had
+# no argument parsing at all, so passing it --check silently performed a full
+# destructive update instead. Refusing to run an unrecognised version is the
+# only safe way to probe it.
+__updater_version__ = "2.1"
+
+TARGET = "/home/xui/bin/maxmind"
+BACKUP_DIR = "/home/xui/bin/maxmind_backups"
+MAX_BACKUPS = 5
+
+# Files this updater writes
+MANAGED = ["GeoLite2.mmdb", "GeoLite2-City.mmdb", "GeoIP2-ISP.mmdb",
+           "cidr.db", "version.json"]
+
+# MaxMind edition -> destination filename used by XUI ONE. Installed verbatim.
+EDITIONS = {
+    "GeoLite2-Country": "GeoLite2.mmdb",
+    "GeoLite2-City": "GeoLite2-City.mmdb",
+}
+
+# Downloaded, then re-emitted under a different schema (see module docstring).
+ASN_EDITION = "GeoLite2-ASN"
+ISP_DEST = "GeoIP2-ISP.mmdb"
+
+PERMALINK = "https://download.maxmind.com/geoip/databases/{ed}/download?suffix=tar.gz"
+LEGACY = ("https://download.maxmind.com/app/geoip_download"
+          "?edition_id={ed}&license_key={key}&suffix=tar.gz")
+
+UA = "xui-monitor-maxmind-updater/2.1"
+
+
+class _DropAuthOnRedirect(urllib.request.HTTPRedirectHandler):
+    """Do not carry the Authorization header to another host.
+
+    MaxMind's permalink endpoint answers a HEAD itself but redirects a GET to
+    a pre-signed URL on its object store. urllib re-sends every header to the
+    redirect target, including Authorization — and an S3-compatible store
+    given both a signature in the query string and an Authorization header
+    refuses the request outright:
+
+        HTTP 400 fetching GeoLite2-Country
+
+    which is exactly the asymmetry that showed up: Check for updates worked,
+    because it is a HEAD and never leaves maxmind.com, and Update failed on
+    the first byte of the download. requests strips the header across hosts
+    for this reason; urllib does not, so this does.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = urllib.request.HTTPRedirectHandler.redirect_request(
+            self, req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        here = urllib.parse.urlsplit(req.full_url).netloc.lower()
+        there = urllib.parse.urlsplit(newurl).netloc.lower()
+        if here != there:
+            # Both spellings: urllib capitalises what add_header stores, and
+            # a header set another way keeps whatever case it was given.
+            for name in list(new.headers):
+                if name.lower() in ("authorization", "proxy-authorization"):
+                    del new.headers[name]
+        return new
+
+
+# Used for every request this script makes, so a redirect behaves the same way
+# wherever it comes from.
+_OPENER = urllib.request.build_opener(_DropAuthOnRedirect)
+
+
+def _urlopen(req, timeout):
+    return _OPENER.open(req, timeout=timeout)
+
+
+_SECRETS = []
+
+
+def _redact(msg):
+    """Strip credentials from anything we print.
+
+    The legacy download URL carries the license key as a query parameter, so
+    an exception string can otherwise leak it into the bot's chat or logs.
+    """
+    out = str(msg)
+    for s in _SECRETS:
+        if s:
+            out = out.replace(s, "***")
+    return re.sub(r"(license_key=)[^&\s]+", r"\1***", out)
+
+
+def log(msg):
+    print(_redact(msg), flush=True)
+
+
+def fail(msg, code=1):
+    log("ERROR:" + str(msg))
+    sys.exit(code)
+
+
+# ── HTTP ──────────────────────────────────────────────────────────────────
+
+def _request(edition, key, account, method="GET"):
+    """Build an authenticated request for a MaxMind edition."""
+    if account:
+        url = PERMALINK.format(ed=edition)
+        req = urllib.request.Request(url, method=method)
+        token = base64.b64encode("{}:{}".format(account, key).encode()).decode()
+        req.add_header("Authorization", "Basic " + token)
+    else:
+        url = LEGACY.format(ed=edition, key=key)
+        req = urllib.request.Request(url, method=method)
+    req.add_header("User-Agent", UA)
+    return req
+
+
+def _http_error(e, edition):
+    if e.code in (401, 403):
+        return ("authentication rejected for {} (HTTP {}). Check the license key, "
+                "and that the account ID matches it.".format(edition, e.code))
+    if e.code == 404:
+        return "edition {} not found (HTTP 404) — is it enabled on the account?".format(edition)
+    if e.code == 429:
+        return "rate limited by MaxMind (HTTP 429) — the daily download limit is 30."
+    if e.code == 400:
+        # What it was, every time it has been seen: the download redirects to
+        # MaxMind's object store, and a request arriving there with an
+        # Authorization header as well as the signature in the URL is refused.
+        return ("HTTP 400 fetching {} — the download redirects to MaxMind's "
+                "object store and the request was refused there. An updater "
+                "older than 2.1 carries the Authorization header across that "
+                "redirect and always fails here.".format(edition))
+    return "HTTP {} fetching {}".format(e.code, edition)
+
+
+def head_last_modified(edition, key, account):
+    """Return the Last-Modified header for an edition, or None."""
+    try:
+        with _urlopen(_request(edition, key, account, "HEAD"), timeout=60) as r:
+            return r.headers.get("Last-Modified")
+    except urllib.error.HTTPError as e:
+        fail(_http_error(e, edition))
+    except Exception as e:
+        fail("cannot reach MaxMind for {}: {}".format(edition, e))
+
+
+def download_edition(edition, key, account, dest_dir, fatal=True):
+    """Download + extract an edition's .mmdb. Returns (path, build_date).
+
+    fatal=False raises instead of exiting, for editions whose failure should
+    not abort the whole run (the ASN source behind GeoIP2-ISP).
+    """
+    def _bail(msg):
+        if fatal:
+            fail(msg)
+        raise RuntimeError(msg)
+
+    tgz = os.path.join(dest_dir, edition + ".tar.gz")
+    try:
+        with _urlopen(_request(edition, key, account), timeout=600) as r:
+            last_mod = r.headers.get("Last-Modified", "")
+            with open(tgz, "wb") as f:
+                shutil.copyfileobj(r, f)
+    except urllib.error.HTTPError as e:
+        _bail(_http_error(e, edition))
+    except Exception as e:
+        _bail("download failed for {}: {}".format(edition, e))
+
+    # The archive contains <Edition>_<YYYYMMDD>/<Edition>.mmdb
+    mmdb_path = None
+    build_date = ""
+    with tarfile.open(tgz, "r:gz") as tf:
+        for member in tf.getmembers():
+            if member.name.endswith(".mmdb"):
+                top = member.name.split("/")[0]
+                if "_" in top:
+                    build_date = top.rsplit("_", 1)[-1]
+                member.name = os.path.basename(member.name)
+                tf.extract(member, dest_dir)
+                mmdb_path = os.path.join(dest_dir, member.name)
+                break
+    os.remove(tgz)
+    if not mmdb_path or not os.path.exists(mmdb_path):
+        fail("no .mmdb inside the {} archive".format(edition))
+    return mmdb_path, (build_date or last_mod)
+
+
+# ── mmdb validation ───────────────────────────────────────────────────────
+
+def verify_mmdb(path, expect_type, probe="8.8.8.8"):
+    """Sanity-check a freshly downloaded mmdb before it replaces a live file.
+
+    Uses maxminddb if available; otherwise falls back to the format's metadata
+    marker so a truncated download or an HTML error page is still caught.
+    """
+    size = os.path.getsize(path)
+    if size < 100000:
+        return False, "file too small ({} bytes) — probably an error page".format(size)
+
+    try:
+        import maxminddb
+    except ImportError:
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 128 * 1024))
+            if b"\xab\xcd\xefMaxMind.com" not in f.read():
+                return False, "missing MaxMind metadata marker"
+        return True, "{:.1f}MB (unverified: maxminddb not installed)".format(size / 1048576)
+
+    try:
+        reader = maxminddb.open_database(path)
+        try:
+            meta = reader.metadata()
+            if expect_type not in meta.database_type:
+                return False, "wrong database type: " + str(meta.database_type)
+            if reader.get(probe) is None:
+                return False, "lookup of {} returned nothing".format(probe)
+            built = datetime.fromtimestamp(meta.build_epoch, timezone.utc).strftime("%Y-%m-%d")
+        finally:
+            reader.close()
+        return True, "{:.1f}MB, built {}".format(size / 1048576, built)
+    except Exception as e:
+        return False, "unreadable: {}".format(e)
+
+
+# ── install helpers ───────────────────────────────────────────────────────
+
+def install(src, dst):
+    """Replace dst with src, preserving dst's existing mode/owner.
+
+    Before the first replacement of any file, the existing copy is preserved as
+    <name>.orig. Those snapshots are what "Restore Original" uses: the factory
+    databases are already on the machine, so fetching them back over the network
+    is both unnecessary and fragile. Timestamped backups rotate after five runs;
+    these do not.
+    """
+    mode, uid, gid = 0o750, None, None
+    if os.path.exists(dst):
+        st = os.stat(dst)
+        mode, uid, gid = st.st_mode & 0o777, st.st_uid, st.st_gid
+        orig = dst + ".orig"
+        if not os.path.exists(orig):
+            try:
+                shutil.copy2(dst, orig)
+                log("ORIGINAL:snapshotted " + os.path.basename(dst))
+            except Exception as e:
+                log("WARN:could not snapshot {}: {}".format(os.path.basename(dst), e))
+
+    tmp = dst + ".new"
+    shutil.copyfile(src, tmp)
+    os.chmod(tmp, mode)
+    if uid is not None:
+        try:
+            os.chown(tmp, uid, gid)
+        except Exception:
+            pass
+    else:
+        try:
+            shutil.chown(tmp, user="xui", group="xui")
+        except Exception:
+            pass
+    os.replace(tmp, dst)          # atomic — never a half-written db on disk
+    try:
+        os.remove(src)
+    except Exception:
+        pass
+
+
+def free_mb(path):
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize / 1048576
+
+
+def stale_holders():
+    """Processes still holding a replaced database open.
+
+    Files are swapped in with an atomic rename, so the old inode survives for
+    as long as any process keeps it open — that process goes on reading the
+    OLD data indefinitely. Short-lived PHP-FPM requests reopen the file and so
+    pick up new data immediately; long-running XUI daemons do not, and need a
+    service reload.
+
+    The kernel marks such descriptors "(deleted)" in /proc, which is a precise
+    signal rather than a guess. Returns [(pid, name, filename)].
+    """
+    found = []
+    if not os.path.isdir("/proc"):
+        return found
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        fd_dir = "/proc/{}/fd".format(pid)
+        try:
+            fds = os.listdir(fd_dir)
+        except Exception:
+            continue                      # process gone, or not ours to inspect
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except Exception:
+                continue
+            if TARGET not in target or "(deleted)" not in target:
+                continue
+            try:
+                with open("/proc/{}/comm".format(pid)) as f:
+                    name = f.read().strip()
+            except Exception:
+                name = "?"
+            fname = os.path.basename(target.split(" (deleted)")[0])
+            entry = (pid, name, fname)
+            if entry not in found:
+                found.append(entry)
+    return found
+
+
+# ── GeoIP2-ISP (synthesised from free ASN data) ───────────────────────────
+
+def build_isp_from_asn(asn_mmdb, tmpdir):
+    """Re-emit GeoLite2-ASN as a GeoIP2-ISP-schema database.
+
+    XUI reads `isp` from this file; GeoLite2-ASN has no such field, so we map
+    both `isp` and `organization` to the AS organisation. Networks are grouped
+    by organisation before insertion (~82k groups instead of ~716k individual
+    inserts), which is what keeps the build near two minutes.
+
+    Raises RuntimeError if the writer library is unavailable.
+    """
+    try:
+        import maxminddb
+        from mmdb_writer import MMDBWriter
+        from netaddr import IPSet, IPNetwork
+    except ImportError as e:
+        raise RuntimeError(
+            "needs the maxminddb and mmdb_writer packages "
+            "(pip3 install maxminddb mmdb_writer): {}".format(e))
+
+    groups = {}
+    total = 0
+    reader = maxminddb.open_database(asn_mmdb)
+    try:
+        src_v6 = reader.metadata().ip_version == 6
+        for net, data in reader:
+            asn = data.get("autonomous_system_number")
+            org = data.get("autonomous_system_organization")
+            if asn is None:
+                continue
+            total += 1
+            groups.setdefault((asn, org), []).append(str(net))
+    finally:
+        reader.close()
+
+    if total < 10000:
+        raise RuntimeError("ASN source only had {} networks — refusing to build".format(total))
+
+    writer = MMDBWriter(
+        ip_version=6 if src_v6 else 4,
+        database_type="GeoIP2-ISP",
+        languages=["en"],
+        description={"en": "Synthesised from GeoLite2-ASN by xui-monitor"},
+        ipv4_compatible=True,
+    )
+    for (asn, org), nets in groups.items():
+        writer.insert_network(
+            IPSet([IPNetwork(n) for n in nets]),
+            {
+                "autonomous_system_number": asn,
+                "autonomous_system_organization": org,
+                "isp": org,
+                "organization": org,
+            },
+        )
+
+    out = os.path.join(tmpdir, ISP_DEST)
+    writer.to_db_file(out)
+    log("ISP_BUILD:{} networks in {} organisations".format(total, len(groups)))
+    return out
+
+
+# ── cidr.db ───────────────────────────────────────────────────────────────
+
+def ip_to_int(ip):
+    return struct.unpack('!I', socket.inet_aton(ip))[0]
+
+
+def download_plain(url, dest, attempts=3):
+    """Fetch a third-party file, retrying transient failures.
+
+    iptoasn.com and raw.githubusercontent.com both 503 from time to time.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            with _urlopen(req, timeout=300) as r:
+                with open(dest, "wb") as f:
+                    shutil.copyfileobj(r, f)
+            return
+        except Exception as e:
+            last = e
+            if i < attempts - 1:
+                time.sleep(5 * (i + 1))
+    raise last
+
+
+def rebuild_cidr(tmpdir):
+    """Rebuild cidr.db from a pristine base + freshly detected hosting ranges.
+
+    The previous implementation merged into the *live* file on every run, so
+    cidr.db grew without bound. We now keep an untouched copy of XUI ONE's
+    original as the base and rebuild from it each time, which keeps the result
+    bounded and deterministic.
+    """
+    live = os.path.join(TARGET, "cidr.db")
+    base_path = os.path.join(TARGET, "cidr.db.orig")
+
+    # First run: snapshot the pristine original as the permanent base.
+    if not os.path.exists(base_path) and os.path.exists(live):
+        shutil.copy2(live, base_path)
+        log("CIDR_BASE:snapshotted original cidr.db")
+
+    src = base_path if os.path.exists(base_path) else live
+    cidr_db = {}
+    if os.path.exists(src):
+        try:
+            with open(src) as f:
+                cidr_db = json.load(f)
+        except Exception as e:
+            log("CIDR_BASE:unreadable ({}) — starting from an empty base".format(e))
+            cidr_db = {}
+    base_asns = len(cidr_db)
+
+    existing = set()
+    for entries in cidr_db.values():
+        for entry in entries.values():
+            if isinstance(entry, list) and len(entry) >= 3:
+                existing.add((entry[1], entry[2]))
+
+    log("DOWNLOADING:iptoasn")
+    asn_gz = os.path.join(tmpdir, "ip2asn-v4.tsv.gz")
+    download_plain("https://iptoasn.com/data/ip2asn-v4.tsv.gz", asn_gz)
+    asn_tsv = os.path.join(tmpdir, "ip2asn-v4.tsv")
+    with gzip.open(asn_gz, "rb") as gi:
+        with open(asn_tsv, "wb") as fo:
+            shutil.copyfileobj(gi, fo)
+
+    log("DOWNLOADING:ipcat")
+    dc_path = os.path.join(tmpdir, "datacenters.csv")
+    download_plain(
+        "https://raw.githubusercontent.com/client9/ipcat/master/datacenters.csv", dc_path)
+
+    entries = []
+    with open(asn_tsv) as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 5 and p[2] != "0":
+                try:
+                    entries.append((ip_to_int(p[0]), ip_to_int(p[1]), p[2], p[0], p[1]))
+                except Exception:
+                    continue
+    entries.sort()
+    starts = [e[0] for e in entries]
+
+    # Flag only the specific ranges that host a known datacenter, not whole
+    # ASNs — otherwise ISPs with a small cloud arm get blanket-flagged.
+    hosting = set()
+    with open(dc_path) as f:
+        for row in csv.reader(f):
+            if len(row) >= 3:
+                try:
+                    v = ip_to_int(row[0].strip())
+                except Exception:
+                    continue
+                i = bisect.bisect_right(starts, v) - 1
+                if 0 <= i < len(entries):
+                    si, ei, asn, sip, eip = entries[i]
+                    if si <= v <= ei:
+                        hosting.add((asn, sip, eip))
+
+    added = 0
+    for asn, sip, eip in sorted(hosting):
+        if (sip, eip) in existing:
+            continue
+        try:
+            cidrs = [str(c) for c in ipaddress.summarize_address_range(
+                ipaddress.IPv4Address(sip), ipaddress.IPv4Address(eip))]
+        except Exception:
+            cidrs = [sip + "/32"]
+        cidr_db.setdefault(asn, {})
+        for c in cidrs:
+            cidr_db[asn][str(len(cidr_db[asn]))] = [c, sip, eip, True]
+        existing.add((sip, eip))
+        added += 1
+
+    for asn in cidr_db:
+        cidr_db[asn] = {str(i): e for i, e in enumerate(cidr_db[asn].values())}
+
+    out = os.path.join(tmpdir, "cidr.db")
+    with open(out, "w") as f:
+        f.write(json.dumps(cidr_db, separators=(",", ":")))
+    log("CIDR_REBUILD:base {} ASNs + {} new ranges".format(base_asns, added))
+    return out, len(cidr_db), added
+
+
+# ── version.json ──────────────────────────────────────────────────────────
+
+def _build_date(builds):
+    """Newest build date across editions, as a date object.
+
+    Values come either from the archive directory name (YYYYMMDD) or from a
+    Last-Modified header, so both shapes are accepted.
+    """
+    best = None
+    for raw in builds.values():
+        d = None
+        if re.fullmatch(r"\d{8}", str(raw or "")):
+            try:
+                d = datetime.strptime(str(raw), "%Y%m%d")
+            except ValueError:
+                d = None
+        if d is None and raw:
+            try:
+                d = datetime.strptime(str(raw)[:25].strip(), "%a, %d %b %Y %H:%M:%S")
+            except ValueError:
+                d = None
+        if d and (best is None or d > best):
+            best = d
+    return best or datetime.now()
+
+
+def update_version_json(tmpdir, builds):
+    """Refresh version.json, preserving whatever schema XUI ONE wrote.
+
+    A value is only replaced when its key looks date-shaped AND its current
+    value already looks like a date — otherwise a field such as
+    {"version": "1.0"} would get clobbered with a build stamp. If the file is
+    missing or unparseable we leave it alone rather than risk feeding the
+    panel a structure it does not expect.
+    """
+    path = os.path.join(TARGET, "version.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception as e:
+        log("VERSION_JSON:left untouched (unparseable: {})".format(e))
+        return None
+    if not isinstance(data, dict):
+        log("VERSION_JSON:left untouched (unexpected structure)")
+        return None
+
+    # The real XUI file is {"geoisp_version": "YYYYMMDD",
+    # "geolite2_version": "YYYYMMDD"} and the two dates differ, so the panel
+    # tracks them separately — map each key to the database it describes
+    # instead of stamping everything with the newest build.
+    geolite_stamp = _build_date({k: v for k, v in builds.items() if "ASN" not in k})
+    isp_stamp = _build_date({k: v for k, v in builds.items() if "ASN" in k}) \
+        if any("ASN" in k for k in builds) else geolite_stamp
+
+    def replace_date(v, stamp):
+        """Substitute the date inside v, keeping v's original format.
+
+        Returns None when v holds no recognisable date, so values such as
+        {"version": "1.0"} are left exactly as they were.
+        """
+        if isinstance(v, int):
+            return int(stamp.strftime("%Y%m%d")) if 20000101 <= v <= 21001231 else None
+        if not isinstance(v, str):
+            return None
+        # YYYY-MM-DD anywhere in the string (covers ISO timestamps too)
+        m = re.search(r"\d{4}-\d{2}-\d{2}", v)
+        if m:
+            return v[:m.start()] + stamp.strftime("%Y-%m-%d") + v[m.end():]
+        # bare YYYYMMDD
+        m = re.fullmatch(r"\s*(\d{8})\s*", v)
+        if m:
+            return v.replace(m.group(1), stamp.strftime("%Y%m%d"))
+        return None
+
+    changed = []
+    for k in list(data.keys()):
+        kl = k.lower()
+        if not any(t in kl for t in ("date", "updated", "build", "time", "version")):
+            continue
+        stamp = isp_stamp if "isp" in kl else geolite_stamp
+        new = replace_date(data[k], stamp)
+        if new is not None and new != data[k]:
+            data[k] = new
+            changed.append("{}={}".format(k, stamp.strftime("%Y%m%d")))
+
+    if not changed:
+        log("VERSION_JSON:no date field recognised — left untouched")
+        return None
+
+    out = os.path.join(tmpdir, "version.json")
+    with open(out, "w") as f:
+        json.dump(data, f)
+    log("VERSION_JSON:updated " + ", ".join(changed))
+    return out
+
+
+# ── main ──────────────────────────────────────────────────────────────────
+
+def main():
+    if "--version" in sys.argv:
+        log("UPDATER:" + __updater_version__)
+        return
+
+    key = os.environ.get("MM_LICENSE_KEY", "").strip()
+    account = os.environ.get("MM_ACCOUNT_ID", "").strip()
+    check_only = "--check" in sys.argv
+
+    _SECRETS.extend(x for x in (key, account) if x)
+
+    if not key:
+        fail("no MaxMind license key configured")
+    if not os.path.isdir(TARGET):
+        fail("{} does not exist — is XUI ONE installed here?".format(TARGET))
+
+    if check_only:
+        for ed in EDITIONS:
+            log("REMOTE:{}:{}".format(ed, head_last_modified(ed, key, account) or "unknown"))
+        for ed, fn in EDITIONS.items():
+            p = os.path.join(TARGET, fn)
+            if os.path.exists(p):
+                mt = datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M")
+                log("LOCAL:{}:{}:{:.1f}MB".format(fn, mt, os.path.getsize(p) / 1048576))
+            else:
+                log("LOCAL:{}:missing".format(fn))
+        log("DONE")
+        return
+
+    tmpdir = tempfile.mkdtemp(prefix="maxmind_update_")
+    try:
+        if free_mb(tmpdir) < 400:
+            fail("not enough free disk space in {} (need ~400MB)".format(tmpdir))
+
+        # 1. Download and verify EVERYTHING before touching the live files, so
+        #    a failure halfway cannot leave the panel with a broken database.
+        staged = {}
+        builds = {}
+        for ed, dest_name in EDITIONS.items():
+            log("DOWNLOADING:" + ed)
+            path, build = download_edition(ed, key, account, tmpdir)
+            expect = "Country" if "Country" in ed else "City"
+            ok, detail = verify_mmdb(path, expect)
+            if not ok:
+                fail("{} failed verification: {}".format(ed, detail))
+            log("VERIFIED:{}:{}".format(dest_name, detail))
+            staged[dest_name] = path
+            builds[ed] = build
+
+        # GeoIP2-ISP is rebuilt from the free ASN edition. Like cidr.db this is
+        # best-effort: if the writer library is missing or the build fails, the
+        # verified GeoLite2 update still goes in and the existing ISP file stays.
+        log("BUILDING:" + ISP_DEST)
+        try:
+            asn_path, asn_build = download_edition(ASN_EDITION, key, account, tmpdir, fatal=False)
+            ok_asn, detail_asn = verify_mmdb(asn_path, "ASN")
+            if not ok_asn:
+                raise RuntimeError("ASN source failed verification: " + detail_asn)
+            isp_path = build_isp_from_asn(asn_path, tmpdir)
+            ok_isp, detail_isp = verify_mmdb(isp_path, "ISP")
+            if not ok_isp:
+                raise RuntimeError("built file failed verification: " + detail_isp)
+            log("VERIFIED:{}:{}".format(ISP_DEST, detail_isp))
+            staged[ISP_DEST] = isp_path
+            builds[ASN_EDITION] = asn_build
+            try:
+                os.remove(asn_path)
+            except Exception:
+                pass
+        except SystemExit:
+            raise
+        except Exception as e:
+            log("SKIPPED:{}:{}".format(ISP_DEST, e))
+
+        # cidr.db is refreshed from third-party sources (iptoasn, ipcat) that go
+        # down periodically. That must not throw away a GeoLite2 update that has
+        # already downloaded and verified cleanly — skip it and carry on.
+        log("BUILDING:cidr.db")
+        cidr_asns = cidr_added = 0
+        try:
+            cidr_path, cidr_asns, cidr_added = rebuild_cidr(tmpdir)
+            staged["cidr.db"] = cidr_path
+        except Exception as e:
+            log("SKIPPED:cidr.db:{}".format(e))
+
+        vpath = update_version_json(tmpdir, builds)
+        if vpath:
+            staged["version.json"] = vpath
+
+        # 2. Back up the current copies of everything we are about to replace.
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_name = "maxmind_backup_" + ts
+        backup_path = os.path.join(BACKUP_DIR, backup_name)
+        os.makedirs(backup_path, exist_ok=True)
+        for fn in MANAGED:
+            src = os.path.join(TARGET, fn)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(backup_path, fn))
+        log("BACKUP:" + backup_name)
+
+        if os.path.isdir(BACKUP_DIR):
+            bks = sorted(d for d in os.listdir(BACKUP_DIR)
+                         if d.startswith("maxmind_backup_")
+                         and os.path.isdir(os.path.join(BACKUP_DIR, d)))
+            while len(bks) > MAX_BACKUPS:
+                shutil.rmtree(os.path.join(BACKUP_DIR, bks.pop(0)), ignore_errors=True)
+
+        # 3. Install.
+        for dest_name, src in staged.items():
+            install(src, os.path.join(TARGET, dest_name))
+
+        for fn in MANAGED:
+            p = os.path.join(TARGET, fn)
+            if os.path.exists(p):
+                log("FILE:{}:{:.1f}MB".format(fn, os.path.getsize(p) / 1048576))
+
+        # Tell the caller whether anything is still reading the old data.
+        for pid, name, fname in stale_holders():
+            log("HOLDER:{}:{}:{}".format(pid, name, fname))
+
+        log("HOSTING_ASNS:{}".format(cidr_asns))
+        log("NEW_RANGES:{}".format(cidr_added))
+        log("DONE")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
