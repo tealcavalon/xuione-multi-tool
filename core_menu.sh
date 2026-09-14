@@ -23,6 +23,10 @@ fi
 
 BASE_URL="tealc.pw/stuff/xuione/new"
 
+# Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
+# sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
+MULTITOOL_VERSION="1.1.0"
+
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 is most stable on the MariaDB 10.5 series (backup/restore in the
 # panel misbehaves when the installer is left to pick 10.3 or 10.6). We install and
@@ -2266,7 +2270,7 @@ show_banner() {
     echo -e "${C}   >  <| |_| || | | (_) | .\` | _|${N}"
     echo -e "${C}  /_/\\_\\\\___/|___| \\___/|_|\\_|___|${N}"
     echo -e "${D}  ----------------------------------------${N}"
-    echo -e "${W}  M U L T I - T O O L${N}  ${D}v1.5.13${N}"
+    echo -e "${W}  M U L T I - T O O L${N}  ${G}v${MULTITOOL_VERSION}${N} ${D}(for XUI.ONE 1.5.13)${N}"
     echo -e "${D}  by ${M}@tealcavalon${D} | Improved Edition${N}"
     echo -e "${D}  ----------------------------------------${N}"
     echo ""
