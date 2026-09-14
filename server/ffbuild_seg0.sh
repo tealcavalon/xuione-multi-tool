@@ -375,7 +375,7 @@ FM="$D/ffmpeg"
 if [ ! -x "$FM" ]; then echo "WANT:none:no_binary"; exit 0; fi
 ENC=$("$FM" -hide_banner -encoders 2>/dev/null)
 DEC=$("$FM" -hide_banner -decoders 2>/dev/null)
-for n in ''; do
+for n in $(cat /root/xui_ffbuild/wanted_req 2>/dev/null); do
   if printf '%s\n' "$ENC" "$DEC" | awk '{print $2}' | grep -qx "$n"; then
     echo "WANT:$n:ok"
   else

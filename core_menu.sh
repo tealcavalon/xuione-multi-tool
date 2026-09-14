@@ -25,7 +25,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.4.0"
+MULTITOOL_VERSION="1.5.0"
 
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 is most stable on the MariaDB 10.5 series (backup/restore in the
@@ -2600,6 +2600,33 @@ fix_ffmpeg_build() {
     local D="/root/xui_ffbuild"
     sudo mkdir -p "$D"
     printf '%s' "$SEG" | sudo tee "$D/segtype" >/dev/null
+
+    # Codecs the panel's own profiles require -> the build refuses to install if
+    # any is missing (faithful to the bot's "wanted" check). Same parser as the
+    # bot, over profiles.profile_options + streams.custom_ffmpeg.
+    local RAW
+    RAW=$( { sudo mysql -N -B -e "SELECT profile_options FROM xui.profiles;" 2>/dev/null; \
+             sudo mysql -N -B -e "SELECT DISTINCT custom_ffmpeg FROM xui.streams WHERE custom_ffmpeg IS NOT NULL AND custom_ffmpeg <> '';" 2>/dev/null; } )
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' "$RAW" | python3 -c '
+import re,sys
+keys=("-vcodec","-acodec","-scodec","-c:v","-c:a","-c:s","-codec:v","-codec:a","-codec")
+NOT={"copy","none","auto","default","","0","1"}
+pat=re.compile(r"(?:%s)[\"\x27]?\s*[:=]?\s*[\"\x27]?\s*([A-Za-z0-9_.+-]+)"%"|".join(re.escape(k) for k in keys))
+w=set()
+for line in sys.stdin:
+    for m in pat.finditer(line):
+        n=m.group(1).strip().strip("\"\x27")
+        if n.lower() not in NOT and not n.startswith("-"): w.add(n)
+print("\n".join(sorted(w)))
+' | sudo tee "$D/wanted_req" >/dev/null
+        local WN
+        WN=$(sudo grep -c . "$D/wanted_req" 2>/dev/null || echo 0)
+        echo "  -> Panel profiles require ${WN} codec(s); the build will refuse to install if any is missing."
+    else
+        printf '' | sudo tee "$D/wanted_req" >/dev/null
+        echo "  -> python3 not present: profile-codec enforcement skipped (build still verifies it runs)."
+    fi
 
     echo "  -> Downloading the build recipe (ffbuild_seg${SEG}.sh)..."
     if ! sudo wget -qO "$D/build.sh" --user="$XUI_AUTH_USER" --password="$XUI_AUTH_PASS" \

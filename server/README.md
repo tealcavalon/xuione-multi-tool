@@ -97,6 +97,11 @@ right variant by the panel's `segment_type`:
 - The build keeps the previous slot binary as `.orig` (and a non-running build
   as `.broken`) and installs only after the binary verifies and passes the
   panel's own live command check.
+- Profile-codec enforcement: the toolkit reads the codecs the panel's own
+  profiles (`profiles.profile_options` + `streams.custom_ffmpeg`) require and
+  writes them to `/root/xui_ffbuild/wanted_req`; the recipe refuses to install a
+  build that is missing any of them. If you update the recipes, re-upload both
+  `ffbuild_seg0.sh` and `ffbuild_seg1.sh`.
 
 ## After deploying — decommission the FTP logging
 
