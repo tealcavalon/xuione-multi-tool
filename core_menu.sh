@@ -2138,6 +2138,204 @@ import_database() {
 }
 
 # ============================================================
+# FIX TOOLS (ported from the xui_monitor bot's FIXES menu)
+# ------------------------------------------------------------
+# The bot ran each fix over SSH across every server; here each runs LOCALLY on
+# the server this script is executed on. Every fix briefs the operator first and
+# asks for confirmation - nothing runs on selection alone.
+# ============================================================
+
+# Mini-briefing + confirmation. Returns 0 to proceed, non-zero to cancel.
+fix_brief() {
+    local title="$1" what="$2" why="$3" risk="$4" revert="$5"
+    echo ""
+    echo -e "  ${W}[FIX] ${title}${N}"
+    echo -e "  ${D}--------------------------------------------------${N}"
+    echo -e "  ${C}What:${N}   $what"
+    echo -e "  ${C}Why:${N}    $why"
+    echo -e "  ${C}Risk:${N}   $risk"
+    echo -e "  ${C}Revert:${N} $revert"
+    echo ""
+    read -p "  $(echo -e "${Y}Proceed? (y/N): ${N}")" _confirm
+    [[ "$_confirm" =~ ^[Yy]$ ]]
+}
+
+# --- FIX: prefer IPv4 (/etc/gai.conf) ---
+fix_ipv6_pref() {
+    local GAI="/etc/gai.conf"
+    local MARK="xui-multi-tool fix_ipv6_pref"
+
+    # Already applied -> offer to revert instead.
+    if grep -v '^#' "$GAI" 2>/dev/null | grep -qF 'precedence ::ffff:0:0/96'; then
+        echo ""
+        echo -e "  ${D}IPv4-preference rule already present in $GAI.${N}"
+        read -p "  $(echo -e "${Y}Remove it (revert)? (y/N): ${N}")" r
+        if [[ "$r" =~ ^[Yy]$ ]]; then
+            sudo cp -p "$GAI" "${GAI}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
+            sudo sed -i "/$MARK/d; \#precedence ::ffff:0:0/96#d" "$GAI"
+            echo "  -> Reverted. System default address selection restored."
+        fi
+        return
+    fi
+
+    fix_brief "Prefer IPv4 (gai.conf)" \
+        "Appends a rule to /etc/gai.conf so the system prefers IPv4 when a host has both A and AAAA." \
+        "On hosts with broken/unrouted IPv6, outbound connections (Let's Encrypt, apt, APIs) hang on IPv6 first." \
+        "Very low - one line appended; a timestamped backup is saved." \
+        "Yes - re-run this option to remove the rule." || { echo "  Cancelled."; return; }
+
+    sudo cp -p "$GAI" "${GAI}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
+    {
+        echo ""
+        echo "# Prefer IPv4 (IPv6 without route) - $MARK"
+        echo "precedence ::ffff:0:0/96  100"
+    } | sudo tee -a "$GAI" >/dev/null
+    echo "  -> Applied."
+    python3 -c "import socket; i=socket.getaddrinfo('acme-v02.api.letsencrypt.org',443,0,socket.SOCK_STREAM); print('  -> Resolver now picks:', 'IPv4' if i[0][0]==socket.AF_INET else 'IPv6')" 2>/dev/null || true
+}
+
+# --- FIX: disable apport (crash reporter) ---
+fix_apport() {
+    fix_brief "Disable apport (crash reporter)" \
+        "Stops the apport service, disables it at boot, and sets enabled=0 in /etc/default/apport." \
+        "apport wakes on crashes to write dumps - wasted CPU/disk on a streaming host that never uses them." \
+        "Low - only a crash reporter is turned off." \
+        "By hand: set enabled=1 in /etc/default/apport and 'systemctl enable --now apport'." || { echo "  Cancelled."; return; }
+
+    sudo systemctl stop apport 2>/dev/null
+    sudo systemctl disable apport 2>/dev/null
+    [ -f /etc/default/apport ] && sudo sed -i 's/^enabled=1/enabled=0/' /etc/default/apport
+    local svc
+    svc=$(systemctl is-active apport 2>/dev/null || echo inactive)
+    if [ "$svc" != "active" ]; then
+        echo "  -> apport disabled (service: $svc)."
+    else
+        echo "  -> WARNING: apport is still active."
+    fi
+}
+
+# --- FIX: time sync (timezone + chrony/NTP) ---
+fix_timesync() {
+    fix_brief "Time sync (timezone + chrony/NTP)" \
+        "Sets the timezone, installs chrony, points it at an NTP pool, and enables clock synchronisation." \
+        "A drifting clock breaks TLS handshakes, EPG timing, line-expiry maths and log correlation." \
+        "Low - installs chrony and rewrites its pool/server lines (chrony.conf backed up first)." \
+        "By hand: restore the chrony.conf.bak.* backup." || { echo "  Cancelled."; return; }
+
+    local TZ POOL
+    read -p "  Timezone [UTC]: " TZ;  [ -z "$TZ" ] && TZ="UTC"
+    read -p "  NTP pool [pool.ntp.org]: " POOL; [ -z "$POOL" ] && POOL="pool.ntp.org"
+
+    sudo timedatectl set-timezone "$TZ" 2>/dev/null
+    sudo apt-get install -y chrony 2>/dev/null
+    local CC="/etc/chrony/chrony.conf"
+    [ ! -f "$CC" ] && CC="/etc/chrony.conf"
+    if [ -f "$CC" ]; then
+        sudo cp -p "$CC" "${CC}.bak.$(date +%Y%m%d%H%M%S)"
+        sudo sed -i '/^pool /d; /^server /d' "$CC"
+        echo "pool $POOL iburst" | sudo tee -a "$CC" >/dev/null
+    fi
+    sudo timedatectl set-ntp on 2>/dev/null
+    sudo systemctl enable --now chrony 2>/dev/null
+    sudo chronyc makestep 2>/dev/null
+    echo "  -> Timezone: $(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo '?')"
+    echo "  -> NTP pool: $POOL"
+
+    # XUI-only extra (mirrors the bot's main-server step): ensure the panel's
+    # default line-expiry window is sane.
+    if check_xui_installed >/dev/null 2>&1; then
+        read -p "  $(echo -e "${C}Also set XUI create_expiration=1440 in the DB? (y/N): ${N}")" ce
+        if [[ "$ce" =~ ^[Yy]$ ]]; then
+            sudo mysql -e "ALTER TABLE xui.settings MODIFY create_expiration INT UNSIGNED NOT NULL DEFAULT 1440;" 2>&1
+            sudo mysql -e "UPDATE xui.settings SET create_expiration = 1440;" 2>&1
+            echo "  -> create_expiration = $(sudo mysql -N -e 'SELECT create_expiration FROM xui.settings LIMIT 1;' 2>/dev/null || echo '?')"
+        fi
+    fi
+}
+
+# --- FIX: DNS resolvers (static resolv.conf) ---
+fix_dns() {
+    # Offer revert first if a previous run left a backup.
+    if sudo test -f /root/dns_fix_backup/latest 2>/dev/null; then
+        echo ""
+        echo -e "  ${D}A previous DNS fix backup exists.${N}"
+        read -p "  $(echo -e "${Y}Revert to the saved resolv.conf/gai.conf? (y/N): ${N}")" r
+        if [[ "$r" =~ ^[Yy]$ ]]; then
+            local BKD
+            BKD=$(sudo cat /root/dns_fix_backup/latest 2>/dev/null)
+            if [ -n "$BKD" ] && sudo test -d "$BKD"; then
+                sudo chattr -i /etc/resolv.conf 2>/dev/null
+                sudo rm -f /etc/resolv.conf
+                if sudo test -f "$BKD/link_target"; then
+                    sudo ln -s "$(sudo cat "$BKD/link_target")" /etc/resolv.conf
+                else
+                    sudo cp -p "$BKD/resolv.conf" /etc/resolv.conf
+                fi
+                sudo cp -p "$BKD/gai.conf" /etc/gai.conf 2>/dev/null
+                sudo systemctl enable --now systemd-resolved 2>/dev/null
+                echo "  -> Reverted from $BKD."
+            else
+                echo "  -> Backup directory missing; cannot revert automatically."
+            fi
+            return
+        fi
+    fi
+
+    fix_brief "DNS resolvers (static resolv.conf)" \
+        "Backs up DNS, disables systemd-resolved, writes fixed resolvers (1.1.1.1/1.0.0.1/8.8.8.8), optional lock." \
+        "The systemd-resolved stub (127.0.0.53) fails/stalls on some hosts, breaking apt/certbot/API lookups." \
+        "Medium - replaces /etc/resolv.conf and stops systemd-resolved; full backup under /root/dns_fix_backup." \
+        "Yes - re-run this option to restore the saved backup." || { echo "  Cancelled."; return; }
+
+    local DO_LOCK=0
+    read -p "  $(echo -e "${C}Lock /etc/resolv.conf so nothing overwrites it (chattr +i)? (y/N): ${N}")" l
+    [[ "$l" =~ ^[Yy]$ ]] && DO_LOCK=1
+
+    local BKD="/root/dns_fix_backup/$(date +%Y%m%d%H%M%S)"
+    sudo mkdir -p "$BKD"
+    [ -L /etc/resolv.conf ] && readlink /etc/resolv.conf | sudo tee "$BKD/link_target" >/dev/null
+    sudo cp -pL /etc/resolv.conf "$BKD/resolv.conf" 2>/dev/null
+    sudo cp -p /etc/gai.conf "$BKD/gai.conf" 2>/dev/null
+    echo "$BKD" | sudo tee /root/dns_fix_backup/latest >/dev/null
+
+    sudo systemctl disable --now systemd-resolved 2>/dev/null
+    sudo chattr -i /etc/resolv.conf 2>/dev/null
+    sudo rm -f /etc/resolv.conf
+    printf '%s\n' \
+        '# managed by fix_dns - xui-multi-tool' \
+        'nameserver 1.1.1.1' \
+        'nameserver 1.0.0.1' \
+        'nameserver 8.8.8.8' \
+        'options timeout:2 attempts:3 rotate' | sudo tee /etc/resolv.conf >/dev/null
+    if [ "$DO_LOCK" -eq 1 ]; then
+        sudo chattr +i /etc/resolv.conf 2>/dev/null && echo "  -> Locked (chattr +i)."
+    fi
+    # gai.conf IPv4 preference (idempotent)
+    grep -v '^#' /etc/gai.conf 2>/dev/null | grep -qF 'precedence ::ffff:0:0/96' || \
+        printf '%s\n' '' '# managed by fix_dns - xui-multi-tool' 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf >/dev/null
+
+    local OK=0 h IP
+    for h in cloudflare.com google.com archive.ubuntu.com; do
+        IP=$(getent ahostsv4 "$h" 2>/dev/null | head -1 | awk '{print $1}')
+        if [ -n "$IP" ]; then OK=$((OK + 1)); echo "  -> $h -> $IP"; else echo "  -> $h FAILED"; fi
+    done
+    [ "$OK" -eq 3 ] && echo "  -> DNS OK." || echo "  -> DNS PARTIAL ($OK/3 resolved)."
+}
+
+# --- FIX: YABS benchmark (network + CPU/disk) ---
+fix_yabs() {
+    fix_brief "YABS benchmark" \
+        "Runs yabs.sh: Geekbench (CPU), fio (disk) and iperf3 network tests against several cities." \
+        "A quick, comparable read on a box's CPU/disk/network before trusting it with load." \
+        "Low - read-only benchmark, but it uses real uplink bandwidth and takes ~10-25 min." \
+        "Nothing to revert - it changes nothing on the server." || { echo "  Cancelled."; return; }
+
+    command -v curl >/dev/null 2>&1 || sudo apt-get install -y curl 2>/dev/null
+    echo "  -> Running yabs.sh (this can take 10-25 minutes)..."
+    curl -sL yabs.sh | bash
+}
+
+# ============================================================
 # STATUS / DIAGNOSTICS
 # ============================================================
 
@@ -2401,6 +2599,20 @@ show_tools_menu() {
         draw_empty
         draw_line
         draw_empty
+        draw_text "FIXES (ported from bot)" "$Y"
+        draw_empty
+        draw_option "8"  "Prefer IPv4" "gai.conf"
+        draw_empty
+        draw_option "9"  "DNS resolvers" "static resolv.conf"
+        draw_empty
+        draw_option "10" "Time sync" "timezone + NTP"
+        draw_empty
+        draw_option "11" "Disable apport" "crash reporter"
+        draw_empty
+        draw_option "12" "YABS benchmark" "CPU/disk/net"
+        draw_empty
+        draw_line
+        draw_empty
         draw_option "B" "Back to Main Menu"
         draw_empty
         draw_line_double
@@ -2415,6 +2627,11 @@ show_tools_menu() {
             5) recompile_nginx ; pause_return ;;
             6) import_database ; pause_return ;;
             7) secure_ssh ; pause_return ;;
+            8) fix_ipv6_pref ; pause_return ;;
+            9) fix_dns ; pause_return ;;
+            10) fix_timesync ; pause_return ;;
+            11) fix_apport ; pause_return ;;
+            12) fix_yabs ; pause_return ;;
             b|B) return ;;
             *) ;;
         esac
