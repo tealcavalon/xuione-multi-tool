@@ -25,7 +25,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.5.1"
+MULTITOOL_VERSION="1.5.2"
 
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 is most stable on the MariaDB 10.5 series (backup/restore in the
@@ -2686,6 +2686,46 @@ print("\n".join(sorted(w)))
     fi
 }
 
+# --- FIX: repair the XUI system user / ownership ---
+# On some servers the 'xui' user/group entry is lost (a failed uninstall, a
+# migration, a manual cleanup). The files keep their numeric uid/gid, which then
+# resolve to whatever names now hold those ids (e.g. fwupd-refresh:_ssh), and the
+# panel - which runs AS 'xui' - breaks. This recreates the user/group if missing
+# and restores ownership of /home/xui to xui:xui.
+fix_xui_user() {
+    if [ ! -d /home/xui ]; then
+        echo "  -> /home/xui not found. Nothing to repair."
+        return
+    fi
+    echo "  -> /home/xui is currently owned by: $(stat -c '%U:%G (uid %u, gid %g)' /home/xui 2>/dev/null)"
+    if id xui >/dev/null 2>&1; then
+        echo "  -> The 'xui' user EXISTS (uid $(id -u xui), gid $(id -g xui))."
+    else
+        echo "  -> The 'xui' user is MISSING - the panel's account was lost."
+    fi
+
+    fix_brief "Repair XUI user & ownership" \
+        "Recreates the 'xui' user/group if missing and chowns /home/xui back to xui:xui." \
+        "XUI.ONE runs as the 'xui' user; if that account is gone the panel, crons and ffmpeg fail." \
+        "Medium - runs chown -R over /home/xui (slow on large content); no data is deleted." \
+        "Ownership can be pointed back at the current owner later if ever needed." || { echo "  Cancelled."; return; }
+
+    getent group xui >/dev/null 2>&1 || { sudo groupadd --system xui && echo "  -> Created group 'xui'."; }
+    if ! id xui >/dev/null 2>&1; then
+        sudo useradd --system --no-create-home --home-dir /home/xui --shell /bin/bash --gid xui xui \
+            && echo "  -> Created user 'xui'."
+    fi
+
+    echo "  -> Restoring ownership (chown -R xui:xui /home/xui) - this may take a while..."
+    sudo chown -R xui:xui /home/xui
+    echo "  -> Done. /home/xui now owned by: $(stat -c '%U:%G' /home/xui 2>/dev/null)"
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^xuione'; then
+        read -p "  $(echo -e "${C}Restart the xuione service now? (y/N): ${N}")" rs
+        [[ "$rs" =~ ^[Yy]$ ]] && { sudo systemctl restart xuione && echo "  -> xuione restarted."; }
+    fi
+}
+
 # ============================================================
 # STATUS / DIAGNOSTICS
 # ============================================================
@@ -2972,6 +3012,8 @@ show_tools_menu() {
         draw_empty
         draw_option "17" "Build ffmpeg 4.4" "compile -> slot"
         draw_empty
+        draw_option "18" "Repair XUI user" "owner -> xui:xui"
+        draw_empty
         draw_line
         draw_empty
         draw_option "B" "Back to Main Menu"
@@ -2998,6 +3040,7 @@ show_tools_menu() {
             15) fix_ssl ; pause_return ;;
             16) fix_maxmind ; pause_return ;;
             17) fix_ffmpeg_build ; pause_return ;;
+            18) fix_xui_user ; pause_return ;;
             b|B) return ;;
             *) ;;
         esac
