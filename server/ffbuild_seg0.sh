@@ -628,7 +628,7 @@ for b in $BINS; do
   # Beside and renamed over: the panel may be running the one in the slot,
   # and writing over a busy binary fails where a rename does not.
   cp "./$b" "$DEST/.$b.new" || fail "copiar $b"
-  chmod 0755 "$DEST/.$b.new"; chown xui:xui "$DEST/.$b.new" 2>/dev/null
+  chmod 0755 "$DEST/.$b.new"; chown "$(stat -c '%u:%g' /home/xui 2>/dev/null || echo 0:0)" "$DEST/.$b.new" 2>/dev/null
   mv -f "$DEST/.$b.new" "$DEST/$b" || fail "por $b na slot"
 done
 V=$("$DEST/ffprobe" -version 2>/dev/null | head -1 | tr -cd '\11\40-\176')

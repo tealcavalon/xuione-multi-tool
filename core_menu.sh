@@ -25,7 +25,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.5.0"
+MULTITOOL_VERSION="1.5.1"
 
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 is most stable on the MariaDB 10.5 series (backup/restore in the
@@ -86,6 +86,14 @@ get_mariadb_codename() {
         25.04) echo "jammy" ;;
         *) echo "jammy" ;;
     esac
+}
+
+# The owner (uid:gid) of the XUI install. XUI's UID/GID frequently map to an
+# unrelated system name (e.g. "fwupd-refresh:_ssh"), so "xui:xui" does not exist
+# as a name on many servers - use the real numeric owner, which chown always
+# accepts. Prints e.g. "1000:1000", or nothing if /home/xui is absent.
+xui_owner() {
+    [ -e /home/xui ] && stat -c '%u:%g' /home/xui 2>/dev/null
 }
 
 check_xui_installed() {
@@ -164,6 +172,26 @@ fix_compatibility() {
     install_legacy_pkg libncurses5 \
         "http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses/libncurses5_6.3-2_amd64.deb" \
         "http://security.ubuntu.com/ubuntu/pool/universe/n/ncurses/libncurses5_6.3-2ubuntu0.1_amd64.deb"
+
+    # libjpeg.so.8 / libpng / libwebp - XUI's bundled PHP (libgd) needs these;
+    # on 22.04+ libjpeg8 is gone, so `./status` fails with "libjpeg.so.8: cannot
+    # open shared object file". These are all in the normal repos.
+    install_legacy_pkg libjpeg-turbo8
+    install_legacy_pkg libpng16-16
+    install_legacy_pkg libwebp7
+
+    # Report any shared libs still missing for XUI's PHP, so the next libFoo.so.N
+    # to install is named rather than found by trial and error.
+    if [ -x /home/xui/bin/php/bin/php ]; then
+        MISSING_SO=$(ldd /home/xui/bin/php/bin/php 2>/dev/null | awk '/not found/{print $1}' | sort -u)
+        if [ -n "$MISSING_SO" ]; then
+            echo "  -> WARNING: XUI PHP still missing shared libraries:"
+            echo "$MISSING_SO" | sed 's/^/         /'
+            echo "     Install the package that provides each (try: apt-file search <lib>)."
+        else
+            echo "  -> XUI PHP shared libraries: OK"
+        fi
+    fi
 
     # libssl1.1 - critical for XUI PHP and nginx binaries
     echo "[2/7] Checking libssl1.1..."
@@ -326,7 +354,8 @@ WRAPPER_EOF
     if [ -d /home/xui ]; then
         echo "  -> Ensuring XUI certbot directories..."
         sudo mkdir -p /home/xui/bin/certbot/{config,work,logs}
-        sudo chown -R xui:xui /home/xui/bin/certbot/
+        XO=$(xui_owner)
+        [ -n "$XO" ] && sudo chown -R "$XO" /home/xui/bin/certbot/
     fi
 
     # Step 6: Fix existing certificates that were generated but not installed
@@ -363,7 +392,8 @@ ssl_session_timeout 10m;
 ssl_session_cache shared:MozSSL:10m;
 ssl_session_tickets off;
 SSLEOF
-                sudo chown xui:xui "$SSL_CONF"
+                XO=$(xui_owner)
+                [ -n "$XO" ] && sudo chown "$XO" "$SSL_CONF"
                 echo "  -> ssl.conf updated! Reloading nginx..."
                 sudo /home/xui/bin/nginx/sbin/nginx -s reload 2>/dev/null
                 echo "  -> NOTE: The XUI panel DB will be updated on next certbot cron run."
