@@ -25,7 +25,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.5.2"
+MULTITOOL_VERSION="1.5.3"
 
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 is most stable on the MariaDB 10.5 series (backup/restore in the
@@ -127,6 +127,20 @@ fix_compatibility() {
     if [[ "$(echo -e "20.04\n$OS_VERSION" | sort -V | tail -1)" == "20.04" ]]; then
         echo "Ubuntu 20.04 detected - no compatibility fixes needed."
         return 0
+    fi
+
+    # XUI.ONE's 1.5.13 installer targets Ubuntu 18/20 and can fail to create its
+    # own 'xui' system user on 22.04+, which leaves the panel unable to run (it
+    # runs AS xui, and every chown to xui:xui then fails). Create it up front,
+    # before the installer, so the install and all later ownership resolve the
+    # name. Idempotent; the dir /home/xui is left for the installer to create.
+    echo "[+] Ensuring the 'xui' user/group exist (the installer targets 18/20)..."
+    getent group xui >/dev/null 2>&1 || { sudo groupadd --system xui && echo "  -> Created group 'xui'."; }
+    if id xui >/dev/null 2>&1; then
+        echo "  -> 'xui' user already present."
+    else
+        sudo useradd --system --no-create-home --home-dir /home/xui --shell /bin/bash --gid xui xui \
+            && echo "  -> Created user 'xui' (home /home/xui)."
     fi
 
     echo "[1/7] Installing legacy libraries..."
