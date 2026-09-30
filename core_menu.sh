@@ -25,15 +25,22 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.5.6"
+MULTITOOL_VERSION="1.5.7"
 
 # --- MariaDB target ---
-# XUI.ONE 1.5.13 is most stable on the MariaDB 10.5 series (backup/restore in the
-# panel misbehaves when the installer is left to pick 10.3 or 10.6). We install and
-# hold a pinned 10.5 version. MARIADB_SERIES is what we verify/accept (major.minor);
-# MARIADB_VERSION is the exact archive.mariadb.org release used for the repo/pin.
-MARIADB_SERIES="10.5"
-MARIADB_VERSION="10.5.27"
+# XUI.ONE 1.5.13 runs well on MariaDB 10.11 (the current LTS, maintained until
+# Feb 2028), confirmed on Ubuntu 20.04/22.04/24.04. We install and hold 10.11.
+#   - On 24.04 (noble) 10.11 IS the OS-native version, so it comes straight from
+#     Ubuntu's own repos (no external repo, nothing to 404).
+#   - On 20.04 (focal) / 22.04 (jammy), where the OS ships an older series, we pull
+#     10.11 from archive.mariadb.org and pin it.
+# The old 10.5 series was end-of-life and had no repo for 24.04, which 404'd and
+# then poisoned apt - do not go back to it.
+# MARIADB_SERIES is what we verify/accept (major.minor). MARIADB_VERSIONS is an
+# ordered list (newest first) of exact archive.mariadb.org releases to try for the
+# archive path: the first one that actually has a repo for this OS codename wins.
+MARIADB_SERIES="10.11"
+MARIADB_VERSIONS="10.11.19 10.11.18 10.11.16 10.11.15 10.11.14 10.11.13 10.11.11 10.11.10"
 
 # Re-validate for security
 VALIDATE=$(wget -qO- --user="$XUI_AUTH_USER" --password="$XUI_AUTH_PASS" --user-agent="Mozilla/5.0" "https://$BASE_URL/test_user_pass" 2>/dev/null)
@@ -66,9 +73,8 @@ detect_os() {
     echo "Detected OS: $OS_ID $OS_VERSION ($OS_CODENAME)"
 }
 
-# Map Ubuntu version to a MariaDB archive codename
-# The MariaDB archive repos only publish up to jammy (22.04); for newer Ubuntu
-# we fall back to the jammy repo (works together with the lib fixes above).
+# Map Ubuntu version to a MariaDB archive codename. Only used on the archive path
+# (18.04/20.04/22.04); on 24.04+ MariaDB 10.11 is installed from the OS repos.
 get_mariadb_codename() {
     case "$OS_VERSION" in
         14.04) echo "trusty" ;;
@@ -80,10 +86,11 @@ get_mariadb_codename() {
         21.10) echo "impish" ;;
         22.04) echo "jammy" ;;
         22.10) echo "kinetic" ;;
-        # Ubuntu 23.04+ / 24.04+ -> no dedicated archive repo, use jammy (last supported)
-        24.04) echo "jammy" ;;
-        24.10) echo "jammy" ;;
-        25.04) echo "jammy" ;;
+        # 24.04+ installs the OS-native MariaDB (no archive repo), but map the real
+        # codename anyway in case the archive path is ever used for these.
+        24.04) echo "noble" ;;
+        24.10) echo "oracular" ;;
+        25.04) echo "plucky" ;;
         *) echo "jammy" ;;
     esac
 }
@@ -323,13 +330,23 @@ fix_compatibility() {
             sudo apt-get install -y python3-venv python3-pip 2>/dev/null
         fi
         CERTBOT_VENV="/opt/certbot-xui"
-        if [ ! -d "$CERTBOT_VENV" ]; then
-            sudo python3 -m venv "$CERTBOT_VENV"
+        if [ ! -d "$CERTBOT_VENV/bin" ]; then
+            sudo python3 -m venv "$CERTBOT_VENV" 2>/dev/null
         fi
-        sudo "$CERTBOT_VENV/bin/pip" install --upgrade pip 2>/dev/null
-        sudo "$CERTBOT_VENV/bin/pip" install certbot 2>/dev/null
-        REAL_CERTBOT="/opt/certbot-xui/bin/certbot"
-        echo "  -> Certbot installed via pip3 at $CERTBOT_VENV"
+        if [ -x "$CERTBOT_VENV/bin/pip" ]; then
+            sudo "$CERTBOT_VENV/bin/pip" install --upgrade pip 2>/dev/null
+            sudo "$CERTBOT_VENV/bin/pip" install certbot 2>/dev/null
+        fi
+        # Only claim success if the binary actually exists (the venv can fail when
+        # python3-venv/ensurepip is unavailable - don't pretend certbot is ready).
+        if [ -x "$CERTBOT_VENV/bin/certbot" ]; then
+            REAL_CERTBOT="$CERTBOT_VENV/bin/certbot"
+            echo "  -> Certbot installed via pip3 at $CERTBOT_VENV"
+        else
+            REAL_CERTBOT=""
+            echo "  -> WARNING: certbot could not be installed (apt + pip3 both failed)."
+            echo "     Let's Encrypt SSL will not work until certbot is installed manually."
+        fi
     fi
 
     # Step 4: Create wrapper script that translates certbot 2.x output to 1.x format
@@ -552,7 +569,37 @@ SSLEOF
 # ============================================================
 
 force_mariadb() {
-    echo "--- Ensuring MariaDB $MARIADB_SERIES (target $MARIADB_VERSION) ---"
+    # XUI.ONE 1.5.13 targets MariaDB 10.11 (current LTS) on every supported Ubuntu.
+    #   - 24.04 (noble) and newer: 10.11 is the OS-native package, so it is installed
+    #     from Ubuntu's own repos (no external repo, nothing to 404).
+    #   - 18.04/20.04/22.04: the OS ships an older series, so 10.11 is pulled from
+    #     archive.mariadb.org and pinned.
+    # We NEVER write an archive repo whose Release file 404s: a broken repo poisons
+    # every later apt-get update, which is what silently broke the unzip/certbot
+    # installs on 24.04 with the old (EOL) 10.5 target.
+    local USE_ARCHIVE MARIA_CODENAME
+    MARIA_CODENAME=$(get_mariadb_codename)
+    case "$OS_VERSION" in
+        24.04|24.10|25.04|25.10|26.04)
+            USE_ARCHIVE=false ;;   # 10.11+ is native here
+        *)
+            USE_ARCHIVE=true ;;    # 18.04/20.04/22.04 (and older): 10.11 from archive
+    esac
+
+    if $USE_ARCHIVE; then
+        echo "--- Ensuring MariaDB $MARIADB_SERIES (archive.mariadb.org, codename $MARIA_CODENAME) ---"
+    else
+        echo "--- Ensuring MariaDB $MARIADB_SERIES (OS-native package for Ubuntu $OS_VERSION) ---"
+    fi
+
+    # Always clear any stale/broken MariaDB archive repo left by a previous run
+    # BEFORE touching apt, so a 404'd repo can never poison this run's apt-get
+    # update calls (the root cause of the unzip/certbot failures on 24.04).
+    sudo rm -f /etc/apt/sources.list.d/mariadb.list \
+               /etc/apt/preferences.d/mariadb.pref \
+               /etc/apt/preferences.d/mariadb-10.6 \
+               /etc/apt/preferences.d/mariadb-10.6.pref \
+               /etc/apt/sources.list.d/mariadb-10.6.list 2>/dev/null
 
     NEED_INSTALL=true
 
@@ -561,7 +608,11 @@ force_mariadb() {
         INSTALLED_VER=$(mysql -V 2>/dev/null | grep -oP 'Distrib \K[0-9]+\.[0-9]+' || echo "unknown")
         echo "Currently installed MariaDB/MySQL version: $INSTALLED_VER"
         if [[ "$INSTALLED_VER" == "$MARIADB_SERIES" ]]; then
-            NEED_INSTALL=false
+            NEED_INSTALL=false          # already on 10.11 (native or archive) - keep it
+        elif ! $USE_ARCHIVE; then
+            # Native path but a different series is already present (unusual on noble).
+            # XUI 1.5.13 runs on it too - accept it rather than fighting the OS repos.
+            [[ "$INSTALLED_VER" != "unknown" ]] && NEED_INSTALL=false
         else
             echo "Version $INSTALLED_VER detected. Replacing with MariaDB $MARIADB_SERIES..."
             sudo systemctl stop mariadb 2>/dev/null
@@ -574,27 +625,34 @@ force_mariadb() {
     fi
 
     if $NEED_INSTALL; then
-        # Add MariaDB repo
-        MARIA_CODENAME=$(get_mariadb_codename)
-        echo "Using MariaDB $MARIADB_VERSION repo with codename: $MARIA_CODENAME"
+        if $USE_ARCHIVE; then
+            # Import MariaDB signing key
+            sudo apt-get install -y apt-transport-https curl gnupg 2>/dev/null
+            sudo mkdir -p /etc/apt/keyrings
+            curl -fsSL https://mariadb.org/mariadb_release_signing_key.pgp | sudo gpg --dearmor --yes -o /etc/apt/keyrings/mariadb-keyring.gpg 2>/dev/null
 
-        # Import MariaDB signing key
-        sudo apt-get install -y apt-transport-https curl gnupg 2>/dev/null
-        sudo mkdir -p /etc/apt/keyrings
-        curl -fsSL https://mariadb.org/mariadb_release_signing_key.pgp | sudo gpg --dearmor --yes -o /etc/apt/keyrings/mariadb-keyring.gpg 2>/dev/null
+            # Try each candidate 10.11 release (newest first) and use the FIRST one
+            # whose repo actually has a Release file for this OS codename. This never
+            # writes a repo that 404s, and it survives archive.mariadb.org dropping an
+            # individual point release (it just moves to the next candidate).
+            local PICKED_REPO="" PICKED_VER="" ver repo
+            for ver in $MARIADB_VERSIONS; do
+                repo="https://archive.mariadb.org/mariadb-${ver}/repo/ubuntu"
+                echo "Checking archive repo for MariaDB $ver ($MARIA_CODENAME)..."
+                if curl -fsL --max-time 20 -o /dev/null "$repo/dists/$MARIA_CODENAME/Release" 2>/dev/null \
+                   || curl -fsL --max-time 20 -o /dev/null "$repo/dists/$MARIA_CODENAME/InRelease" 2>/dev/null; then
+                    PICKED_REPO="$repo"; PICKED_VER="$ver"
+                    echo "  -> Using MariaDB $ver from archive.mariadb.org"
+                    break
+                fi
+            done
 
-        # Add repository - using archive.mariadb.org (dlm.mariadb.com returns 404)
-        MARIADB_REPO="https://archive.mariadb.org/mariadb-${MARIADB_VERSION}/repo/ubuntu"
-        echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/mariadb-keyring.gpg] $MARIADB_REPO $MARIA_CODENAME main" | \
-            sudo tee /etc/apt/sources.list.d/mariadb.list
+            if [ -n "$PICKED_REPO" ]; then
+                echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/mariadb-keyring.gpg] $PICKED_REPO $MARIA_CODENAME main" | \
+                    sudo tee /etc/apt/sources.list.d/mariadb.list
 
-        # Remove legacy repo/preferences files left by older tool versions (e.g. 10.6)
-        sudo rm -f /etc/apt/preferences.d/mariadb-10.6 \
-                   /etc/apt/preferences.d/mariadb-10.6.pref \
-                   /etc/apt/sources.list.d/mariadb-10.6.list
-
-        # Pin MariaDB to archive.mariadb.org to prevent repo-level upgrades
-        cat <<PINEOF | sudo tee /etc/apt/preferences.d/mariadb.pref
+                # Pin MariaDB to archive.mariadb.org to prevent repo-level upgrades
+                cat <<PINEOF | sudo tee /etc/apt/preferences.d/mariadb.pref
 Package: mariadb-*
 Pin: origin archive.mariadb.org
 Pin-Priority: 1000
@@ -607,15 +665,33 @@ Package: galera-*
 Pin: origin archive.mariadb.org
 Pin-Priority: 1000
 PINEOF
+            else
+                echo ""
+                echo "  WARNING: No MariaDB $MARIADB_SERIES archive repo is available for"
+                echo "           codename '$MARIA_CODENAME' right now. NOT adding a broken"
+                echo "           repo. Falling back to the OS-native MariaDB (from Ubuntu's"
+                echo "           own repos) so the install still completes cleanly."
+                echo ""
+                # Make sure nothing broken is left behind, then switch to native.
+                sudo rm -f /etc/apt/sources.list.d/mariadb.list /etc/apt/preferences.d/mariadb.pref 2>/dev/null
+                USE_ARCHIVE=false
+            fi
+        fi
 
         sudo apt-get update
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server mariadb-client
 
         # Verify install
         FINAL_VER=$(mysql -V 2>/dev/null | grep -oP 'Distrib \K[0-9]+\.[0-9]+' || echo "failed")
-        if [[ "$FINAL_VER" != "$MARIADB_SERIES" ]]; then
-            echo "WARNING: MariaDB installation may have issues. Expected $MARIADB_SERIES, detected: $FINAL_VER"
+        if [[ "$FINAL_VER" == "failed" ]]; then
+            echo "ERROR: MariaDB install failed - no server/client is present."
             return 1
+        fi
+        if [[ "$FINAL_VER" == "$MARIADB_SERIES" ]]; then
+            echo "MariaDB $FINAL_VER installed."
+        else
+            echo "NOTE: MariaDB $FINAL_VER installed (OS-native series, not $MARIADB_SERIES)."
+            echo "      XUI.ONE 1.5.13 also runs on this version."
         fi
     fi
 
@@ -661,15 +737,14 @@ install_xui() {
     # pass "skip-fixes" so we don't do the whole compatibility/MariaDB pass twice.
     if [[ "$1" == "skip-fixes" ]]; then
         echo "Pre-install compatibility/MariaDB already handled by caller - skipping."
-    elif [[ "$OS_VERSION" == "20.04" ]]; then
-        # Ubuntu 20.04: XUI.ONE installer handles everything natively, no fixes needed
-        echo "Ubuntu 20.04 detected - no compatibility fixes required."
     else
-        # Ubuntu 22.04+ needs compatibility fixes before the installer - run them
-        # automatically so the operator need not invoke Fix Compatibility by hand.
+        # Run compatibility fixes (a no-op on <=20.04) and install MariaDB 10.11
+        # before the installer, on EVERY supported Ubuntu including 20.04 - the
+        # panel is confirmed on 10.11, so we standardise on it rather than letting
+        # the installer pick the old OS-native series (10.3 on 20.04).
         # MariaDB is only for a MAIN server; a Load Balancer has no local database.
         echo ""
-        echo "Ubuntu $OS_VERSION detected - compatibility fixes will run automatically before install."
+        echo "Ubuntu $OS_VERSION detected - compatibility fixes + MariaDB run before the installer."
         read -p "  $(echo -e "${C}Is this a MAIN server (has the database)? [Y/n]: ${N}")" IS_MAIN
         echo ""
         fix_compatibility
@@ -684,7 +759,22 @@ install_xui() {
 
     cd /tmp
 
-    sudo apt-get update && sudo apt-get install -y unzip wget software-properties-common
+    # Install the tools the installer needs. Do NOT chain these with '&&' on the
+    # apt-get update: if update returns non-zero (e.g. a transient repo error),
+    # '&&' would skip the install and leave 'unzip' missing - which is exactly how
+    # the XUI ZIP failed to extract ("unzip: command not found"). Run them
+    # separately and then hard-verify unzip is actually present.
+    sudo apt-get update
+    sudo apt-get install -y unzip wget software-properties-common
+    if ! command -v unzip >/dev/null 2>&1; then
+        # Last resort: try the archive .deb directly so a broken mirror can't block us.
+        sudo apt-get install -y --no-install-recommends unzip 2>/dev/null
+    fi
+    if ! command -v unzip >/dev/null 2>&1; then
+        echo "ERROR: 'unzip' is required to extract the XUI package but could not be"
+        echo "       installed. Fix apt (e.g. 'sudo apt-get update') and retry."
+        return 1
+    fi
 
     if [[ "$OS_VERSION" != "20.04" ]]; then
         # Install MaxMind GeoIP (required by XUI.ONE, already in 20.04 repos via installer)
@@ -3210,6 +3300,27 @@ run_full_setup() {
     echo -e "  ${C}[3/6]${N} ${W}XUI.ONE 1.5.13...${N}"
     echo -e "  ${D}----------------------------------------------${N}"
     install_xui skip-fixes
+
+    # Did the panel actually install? The installer (or a missing 'unzip', a bad
+    # download, etc.) can fail without aborting the sequence - don't claim success
+    # when /home/xui was never created.
+    if [ ! -d /home/xui ] || [ ! -f /home/xui/config/config.ini ]; then
+        echo ""
+        echo -e "${R}"
+        echo '   _____ _    ___ _    ___ ___ '
+        echo '  |  ___/ \  |_ _| |  | __|   \ '
+        echo '  | |_ / _ \  | || |__| _|| |) |'
+        echo '  |  _/ ___ \ | || |__| |  |  _/ '
+        echo '  |_|/_/   \_\___|____|___|_|   '
+        echo -e "${N}"
+        echo -e "  ${R}XUI.ONE did NOT install (/home/xui is missing).${N}"
+        echo -e "  ${Y}Review the [3/6] output above for the real error (common causes:${N}"
+        echo -e "  ${Y}a failed download, a broken apt repo, or a missing 'unzip').${N}"
+        echo -e "  ${D}Steps 4-6 (DB import, optimization, MySQL security) were skipped${N}"
+        echo -e "  ${D}because they need an installed panel. Fix the error and re-run.${N}"
+        echo ""
+        return
+    fi
 
     echo ""
     echo -e "  ${C}[4/6]${N} ${W}Database import...${N}"
