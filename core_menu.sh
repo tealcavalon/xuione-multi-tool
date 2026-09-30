@@ -25,7 +25,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.5.4"
+MULTITOOL_VERSION="1.5.5"
 
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 is most stable on the MariaDB 10.5 series (backup/restore in the
@@ -665,7 +665,12 @@ install_xui() {
         # Ubuntu 20.04: XUI.ONE installer handles everything natively, no fixes needed
         echo "Ubuntu 20.04 detected - no compatibility fixes required."
     else
-        # Ubuntu 22.04+ needs compatibility fixes and our pinned MariaDB series
+        # Ubuntu 22.04+ needs compatibility fixes and our pinned MariaDB series.
+        # Run them automatically before the installer - the operator does not
+        # need to invoke Fix Compatibility by hand first.
+        echo ""
+        echo "Ubuntu $OS_VERSION detected - running Fix Compatibility + MariaDB automatically before install..."
+        echo ""
         fix_compatibility
         force_mariadb
     fi
