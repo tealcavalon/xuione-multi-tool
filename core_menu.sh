@@ -21,11 +21,22 @@ else
     exit 1
 fi
 
+# --- Root check ---
+# The toolkit installs packages, writes system files and manages services, so it
+# must run as root. Abort immediately otherwise. (Colours are defined further
+# down, so use inline escapes here.)
+if [ "$(id -u)" -ne 0 ]; then
+    printf '\n\033[0;31m  ROOT REQUIRED\033[0m\n'
+    printf '\033[1;33m  This tool must be run as root.\033[0m\n'
+    printf '\033[0;90m  Switch to root (e.g. "sudo -i") and run it again.\033[0m\n\n'
+    exit 1
+fi
+
 BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.5.7"
+MULTITOOL_VERSION="1.5.8"
 
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 runs well on MariaDB 10.11 (the current LTS, maintained until

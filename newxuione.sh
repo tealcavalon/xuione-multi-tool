@@ -5,7 +5,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the loader/toolkit itself, NOT the XUI.ONE version).
 # Shown in the banner before login so users can tell they are on the latest build.
-MULTITOOL_VERSION="1.5.7"
+MULTITOOL_VERSION="1.5.8"
 
 # Colors
 R='\033[0;31m'
@@ -16,6 +16,25 @@ M='\033[0;35m'
 W='\033[1;37m'
 D='\033[0;90m'
 N='\033[0m'
+
+# ============================================================
+# ROOT CHECK - the toolkit installs packages, writes system files and manages
+# services, so it must run as root. Abort immediately if it is not.
+# ============================================================
+if [ "$(id -u)" -ne 0 ]; then
+    echo ""
+    echo -e "  ${R}+-------------------------------------------------+${N}"
+    echo -e "  ${R}|                 ROOT REQUIRED                   |${N}"
+    echo -e "  ${R}+-------------------------------------------------+${N}"
+    echo ""
+    echo -e "  ${Y}This tool must be run as ${W}root${Y}.${N}"
+    echo -e "  ${D}Switch to root and run it again, e.g.:${N}"
+    echo ""
+    echo -e "    ${W}sudo -i${N}      ${D}# become root, then re-run the command${N}"
+    echo -e "    ${D}or prefix the command with ${W}sudo${N}"
+    echo ""
+    exit 1
+fi
 
 # ============================================================
 # HELPERS
