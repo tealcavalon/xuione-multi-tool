@@ -25,7 +25,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.5.3"
+MULTITOOL_VERSION="1.5.4"
 
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 is most stable on the MariaDB 10.5 series (backup/restore in the
@@ -173,6 +173,26 @@ fix_compatibility() {
         return 1
     }
 
+    # Helper for libs renamed with a t64 suffix on Ubuntu 24.04 (time_t
+    # transition): try the base name, then <base>t64.
+    install_gd_lib() {
+        local base="$1"
+        if dpkg -l "$base" 2>/dev/null | grep -q "^ii" || dpkg -l "${base}t64" 2>/dev/null | grep -q "^ii"; then
+            echo "  -> $base already installed"
+            return 0
+        fi
+        if sudo apt-get install -y "$base" 2>/dev/null; then
+            echo "  -> $base installed via apt"
+            return 0
+        fi
+        if sudo apt-get install -y "${base}t64" 2>/dev/null; then
+            echo "  -> ${base}t64 installed via apt"
+            return 0
+        fi
+        echo "  WARNING: Could not install $base (or ${base}t64)"
+        return 1
+    }
+
     # libaio1 - required by MariaDB
     install_legacy_pkg libaio1 \
         "http://archive.ubuntu.com/ubuntu/pool/main/liba/libaio/libaio1_0.3.112-13build1_amd64.deb"
@@ -190,9 +210,9 @@ fix_compatibility() {
     # libjpeg.so.8 / libpng / libwebp - XUI's bundled PHP (libgd) needs these;
     # on 22.04+ libjpeg8 is gone, so `./status` fails with "libjpeg.so.8: cannot
     # open shared object file". These are all in the normal repos.
-    install_legacy_pkg libjpeg-turbo8
-    install_legacy_pkg libpng16-16
-    install_legacy_pkg libwebp7
+    install_gd_lib libjpeg-turbo8
+    install_gd_lib libpng16-16
+    install_gd_lib libwebp7
 
     # Report any shared libs still missing for XUI's PHP, so the next libFoo.so.N
     # to install is named rather than found by trial and error.
