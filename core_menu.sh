@@ -36,7 +36,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.5.8"
+MULTITOOL_VERSION="1.5.9"
 
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 runs well on MariaDB 10.11 (the current LTS, maintained until
@@ -1073,16 +1073,47 @@ secure_mysql() {
         HAS_IP6=1
     fi
 
-    # Flush any existing MySQL rules to start clean
-    echo "Flushing existing MySQL firewall rules..."
-    sudo iptables -D INPUT -p tcp --dport 3306 -j DROP 2>/dev/null
-    sudo iptables -F MYSQL_BRUTE 2>/dev/null
-    sudo iptables -X MYSQL_BRUTE 2>/dev/null
-    if [ "$HAS_IP6" -eq 1 ]; then
-        sudo ip6tables -D INPUT -p tcp --dport 3306 -j DROP 2>/dev/null
-        sudo ip6tables -F MYSQL_BRUTE 2>/dev/null
-        sudo ip6tables -X MYSQL_BRUTE 2>/dev/null
+    # Helper: remove EVERY INPUT rule touching port 3306 (ACCEPT and DROP alike),
+    # plus the brute-force chain, for one family. Deletes by line number, highest
+    # first, so earlier indices stay valid. The general ESTABLISHED,RELATED rule is
+    # left untouched (it does not name 3306), so existing sessions keep working.
+    flush_mysql_family() {
+        local cmd="$1" nums n
+        nums=$(sudo $cmd -L INPUT -n --line-numbers 2>/dev/null | awk '/dpt:3306/{print $1}' | sort -rn)
+        for n in $nums; do sudo $cmd -D INPUT "$n" 2>/dev/null; done
+        sudo $cmd -F MYSQL_BRUTE 2>/dev/null
+        sudo $cmd -X MYSQL_BRUTE 2>/dev/null
+    }
+
+    # Helper: persist the current rules (netfilter-persistent, or a file fallback).
+    save_fw_rules() {
+        if ! sudo netfilter-persistent save 2>/dev/null; then
+            sudo mkdir -p /etc/iptables
+            sudo iptables-save | sudo tee /etc/iptables/rules.v4 >/dev/null
+            [ "$HAS_IP6" -eq 1 ] && sudo ip6tables-save | sudo tee /etc/iptables/rules.v6 >/dev/null
+        fi
+    }
+
+    # If a lockdown already exists, offer to simply UNDO it. This is the quick fix
+    # when Load Balancers / boxes got blocked after a previous run.
+    if sudo iptables -L INPUT -n 2>/dev/null | grep -q "dpt:3306"; then
+        echo ""
+        echo "Existing MySQL (3306) firewall rules were found."
+        read -p "  REMOVE them and reopen port 3306 (undo the lockdown)? [y/N]: " UNDO_FW
+        if [[ "$UNDO_FW" =~ ^[Yy]$ ]]; then
+            flush_mysql_family iptables
+            [ "$HAS_IP6" -eq 1 ] && flush_mysql_family ip6tables
+            save_fw_rules
+            echo "  -> All MySQL firewall rules removed. Port 3306 is open again."
+            echo "--- MySQL firewall reverted ---"
+            return
+        fi
     fi
+
+    # Flush any existing MySQL rules to start clean (rebuild from scratch)
+    echo "Flushing existing MySQL firewall rules..."
+    flush_mysql_family iptables
+    [ "$HAS_IP6" -eq 1 ] && flush_mysql_family ip6tables
 
     # 1. Allow established connections (first)
     sudo iptables -C INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
@@ -1108,43 +1139,106 @@ secure_mysql() {
         sudo ip6tables -A MYSQL_BRUTE -m recent --name mysqlbf6 --set -j ACCEPT
     fi
 
-    # 4. Authorize additional IPs
+    # Helper: authorize one IP/CIDR on 3306, routed to the right firewall family.
+    authorize_ip() {
+        local ip="$1"
+        case "$ip" in
+            ""|127.0.0.1|::1|0.0.0.0|localhost) return 1 ;;
+        esac
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
+            sudo iptables -A INPUT -p tcp --dport 3306 -s "$ip" -j ACCEPT
+            echo "  -> $ip authorized (IPv4)"; return 0
+        elif [[ "$ip" == *:* ]]; then
+            if [ "$HAS_IP6" -eq 1 ]; then
+                sudo ip6tables -A INPUT -p tcp --dport 3306 -s "$ip" -j ACCEPT
+                echo "  -> $ip authorized (IPv6)"; return 0
+            fi
+            echo "  -> IPv6 firewall unavailable on this host; skipped $ip"; return 1
+        fi
+        echo "  -> Invalid IP format: $ip (use x.x.x.x, x.x.x.x/xx or an IPv6 address)"
+        return 1
+    }
+
+    # 4a. AUTO-DISCOVER the servers that legitimately need MySQL access, so we never
+    # lock out the panel's own Load Balancers / streaming servers (the usual cause of
+    # "my boxes/lines stopped connecting after Secure MySQL"). We look at:
+    #   - the XUI DB table 'streaming_servers' (every server/LB registered in the panel)
+    #   - IPs currently connected to port 3306 (active sessions)
     echo ""
-    echo "Enter IPs to authorize for MySQL access (IPv4 or IPv6, one per line)."
+    echo "Auto-discovering servers that use MySQL (so they are not locked out)..."
+
+    DB_NAME="xui"
+    [ -f /home/xui/config/config.ini ] && \
+        DB_NAME=$(grep -oP 'database\s*=\s*"\K[^"]+' /home/xui/config/config.ini 2>/dev/null || echo xui)
+    DB_NAME="${DB_NAME:-xui}"
+
+    DISCOVERED=""
+    # From the panel DB (root via local socket; this tool already requires root).
+    DB_IPS=$(sudo mysql -u root -N -e \
+        "SELECT server_ip FROM \`$DB_NAME\`.streaming_servers WHERE server_ip IS NOT NULL AND server_ip <> '';" 2>/dev/null)
+    [ -n "$DB_IPS" ] && DISCOVERED="$DISCOVERED $DB_IPS"
+    # From live connections on 3306 (remote peer addresses, port stripped).
+    if command -v ss &>/dev/null; then
+        LIVE_IPS=$(sudo ss -Htn state established '( sport = :3306 )' 2>/dev/null \
+            | awk '{print $NF}' | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//')
+        [ -n "$LIVE_IPS" ] && DISCOVERED="$DISCOVERED $LIVE_IPS"
+    fi
+
+    # De-duplicate, drop local/placeholder addresses.
+    DISCOVERED=$(echo "$DISCOVERED" | tr ' ' '\n' | sort -u | grep -vE '^(127\.0\.0\.1|::1|0\.0\.0\.0|localhost)?$')
+
+    if [ -n "$DISCOVERED" ]; then
+        echo ""
+        echo "These servers are registered in the panel / currently connected:"
+        echo "$DISCOVERED" | sed 's/^/    /'
+        echo ""
+        read -p "  Auto-authorize all of the above for MySQL? [Y/n]: " AUTO_OK
+        if [[ ! "$AUTO_OK" =~ ^[Nn]$ ]]; then
+            while read -r dip; do [ -n "$dip" ] && authorize_ip "$dip"; done <<< "$DISCOVERED"
+        else
+            echo "  Skipped auto-authorize (you can still add them manually below)."
+        fi
+    else
+        echo "  No remote servers found in the panel DB or active 3306 connections."
+        echo "  (If this is a MAIN server with Load Balancers, add their IPs below.)"
+    fi
+
+    # 4b. Manually authorize any additional IPs
+    echo ""
+    echo "Enter any EXTRA IPs to authorize for MySQL access (IPv4 or IPv6, one per line)."
     echo "Press Enter with empty input to finish."
     while true; do
         read -p "  Authorize IP: " AUTH_IP
         [ -z "$AUTH_IP" ] && break
-        # Validate IP format (basic) and route to the matching firewall family
-        if [[ "$AUTH_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-            sudo iptables -A INPUT -p tcp --dport 3306 -s "$AUTH_IP" -j ACCEPT
-            echo "  -> $AUTH_IP authorized (IPv4)"
-        elif [[ "$AUTH_IP" == *:* ]]; then
-            if [ "$HAS_IP6" -eq 1 ]; then
-                sudo ip6tables -A INPUT -p tcp --dport 3306 -s "$AUTH_IP" -j ACCEPT
-                echo "  -> $AUTH_IP authorized (IPv6)"
-            else
-                echo "  -> IPv6 firewall unavailable on this host; skipped $AUTH_IP"
-            fi
-        else
-            echo "  -> Invalid IP format: $AUTH_IP (use x.x.x.x, x.x.x.x/xx or an IPv6 address)"
-        fi
+        authorize_ip "$AUTH_IP"
     done
 
     # 5. Route new connections through brute-force check
     sudo iptables -A INPUT -p tcp --dport 3306 --syn -j MYSQL_BRUTE
     [ "$HAS_IP6" -eq 1 ] && sudo ip6tables -A INPUT -p tcp --dport 3306 --syn -j MYSQL_BRUTE
 
-    # 6. Drop everything else (last rule)
-    sudo iptables -A INPUT -p tcp --dport 3306 -j DROP
-    [ "$HAS_IP6" -eq 1 ] && sudo ip6tables -A INPUT -p tcp --dport 3306 -j DROP
+    # 6. Drop everything else (last rule) - with an explicit, loud confirmation,
+    # because this is the step that blocks every IP not authorized above.
+    echo ""
+    echo "=================================================================="
+    echo " FINAL STEP: block MySQL (3306) for every IP NOT authorized above."
+    echo " Authorized so far (localhost + the IPs listed above). ANY other"
+    echo " server - a Load Balancer or box whose IP is NOT in that list -"
+    echo " will be UNABLE to connect to this database until you re-run this"
+    echo " and authorize it (or undo the rule)."
+    echo "=================================================================="
+    read -p "  Apply the blocking rule now? [y/N]: " DROP_OK
+    if [[ "$DROP_OK" =~ ^[Yy]$ ]]; then
+        sudo iptables -A INPUT -p tcp --dport 3306 -j DROP
+        [ "$HAS_IP6" -eq 1 ] && sudo ip6tables -A INPUT -p tcp --dport 3306 -j DROP
+        echo "  -> MySQL is now restricted to the authorized IPs."
+    else
+        echo "  -> Blocking rule NOT applied. Port 3306 stays reachable (no lockout)."
+        echo "     The brute-force throttle on new connections is still active."
+    fi
 
     # Save (both families)
-    if ! sudo netfilter-persistent save 2>/dev/null; then
-        sudo mkdir -p /etc/iptables
-        sudo iptables-save | sudo tee /etc/iptables/rules.v4 >/dev/null
-        [ "$HAS_IP6" -eq 1 ] && sudo ip6tables-save | sudo tee /etc/iptables/rules.v6 >/dev/null
-    fi
+    save_fw_rules
 
     echo ""
     echo "MySQL firewall rules applied (IPv4):"
