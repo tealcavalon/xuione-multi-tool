@@ -11,8 +11,13 @@ limit real (a client can no longer bypass it by editing the loader or the log).
 - Runs inside the Basic-auth-protected directory, so it only executes for an
   authenticated user. The username comes from the authenticated session
   (`PHP_AUTH_USER`, or the `Authorization` header) — **not** from the client.
-- Determines the real client IP (`CF-Connecting-IP` → first `X-Forwarded-For` →
-  `REMOTE_ADDR`), so it is correct even behind Cloudflare / a proxy.
+- Determines the real client IP from `REMOTE_ADDR`. `CF-Connecting-IP` is
+  believed only when the connection comes from Cloudflare's own ranges, and
+  `X-Forwarded-For` only from a proxy listed in `TRUSTED_PROXIES` (loopback by
+  default): a client can send either header itself, and doing so used to let
+  one account count every server as the same source. The Cloudflare list is
+  built in; a `cf_ips.txt` beside the script (one CIDR per line) replaces it.
+  `php tests/log_access_ip.php` checks this.
 - Enforces `MAX_SOURCES_24H` distinct servers per user per 24h. Sources are
   grouped by IPv4 `/24` and IPv6 `/64`, so a server with a dynamic address is
   not miscounted as several servers.

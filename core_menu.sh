@@ -36,7 +36,7 @@ BASE_URL="tealc.pw/stuff/xuione/new"
 
 # Multi-Tool version (the toolkit itself, NOT the XUI.ONE version). Keep this in
 # sync with MULTITOOL_VERSION in the loader (newxuione.sh) on each release.
-MULTITOOL_VERSION="1.5.9"
+MULTITOOL_VERSION="1.5.10"
 
 # --- MariaDB target ---
 # XUI.ONE 1.5.13 runs well on MariaDB 10.11 (the current LTS, maintained until
@@ -2601,7 +2601,8 @@ fix_yabs() {
 
     command -v curl >/dev/null 2>&1 || sudo apt-get install -y curl 2>/dev/null
     echo "  -> Running yabs.sh (this can take 10-25 minutes)..."
-    curl -sL yabs.sh | bash
+    # -f: an HTTP error page is not piped into bash. https: not the redirect from http.
+    curl -fsSL https://yabs.sh | bash
 }
 
 # --- FIX: series repair (orphan episode rows) ---
@@ -3186,7 +3187,7 @@ show_install_menu() {
                     echo ""
                     echo -e "  ${G}Starting installation...${N}"
                     echo ""
-                    curl -sL https://tealc.pw/@tealcavalon/xui-monitor/install.sh | bash
+                    curl -fsSL https://tealc.pw/@tealcavalon/xui-monitor/install.sh | bash
                     exit 0
                 else
                     echo -e "  ${D}Installation cancelled.${N}"

@@ -23,6 +23,26 @@ const WINDOW_SECONDS  = 86400;             // rate-limit window (24h)
 const RETENTION_DAYS  = 30;                // prune log entries older than this
 define('LOG_DIR', __DIR__ . '/logs');      // per-user logs live here (kept out of the web)
 
+// Cloudflare's ranges, https://www.cloudflare.com/ips-v4 and /ips-v6. They
+// change rarely; a cf_ips.txt beside this file (one CIDR per line) replaces
+// the list without touching the code.
+const CLOUDFLARE_RANGES = [
+    '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+    '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+    '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+    '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22',
+    '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32',
+    '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32',
+];
+// A reverse proxy on this machine that sets X-Forwarded-For (none by default
+// on cPanel; add its address here if there is one).
+const TRUSTED_PROXIES = ['127.0.0.1/32', '::1/128'];
+
+// Loaded by tests/log_access_ip.php for its functions only.
+if (defined('LOG_ACCESS_LIBRARY')) {
+    return;
+}
+
 header('Content-Type: text/plain; charset=utf-8');
 header('Cache-Control: no-store');
 
@@ -86,24 +106,79 @@ $client_v4 = filter_var($_POST['client_ipv4'] ?? '', FILTER_VALIDATE_IP, FILTER_
 $client_v6 = filter_var($_POST['client_ipv6'] ?? '', FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) ?: 'none';
 
 // ---- Determine the real client IP (works behind Cloudflare / a proxy) ----
-function client_ip(): string {
-    $candidates = [];
-    if (!empty($_SERVER['HTTP_CF_CONNECTING_IP'])) {
-        $candidates[] = $_SERVER['HTTP_CF_CONNECTING_IP'];
+// CF-Connecting-IP and X-Forwarded-For are headers like any other: a client
+// can send them. Read as they came, one loader sending the same made-up
+// address from every server it runs on counted as one source, and the
+// MAX_SOURCES_24H limit was gone. They are believed only from the hop that
+// sets them: CF-Connecting-IP when the connection comes from Cloudflare
+// itself, X-Forwarded-For when it comes from a proxy of this host's own
+// (TRUSTED_PROXIES). Anything else is REMOTE_ADDR, which cannot be forged.
+function ip_in_cidr(string $ip, string $cidr): bool {
+    $parts = explode('/', trim($cidr), 2);
+    $net = @inet_pton($parts[0]);
+    $addr = @inet_pton($ip);
+    if ($net === false || $addr === false || strlen($net) !== strlen($addr)) {
+        return false;
     }
-    if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-        $parts = explode(',', (string) $_SERVER['HTTP_X_FORWARDED_FOR']);
-        $candidates[] = trim($parts[0]); // first entry is the origin client
+    $bits = isset($parts[1]) && ctype_digit($parts[1]) ? (int) $parts[1] : strlen($net) * 8;
+    $bytes = intdiv($bits, 8);
+    if (substr($net, 0, $bytes) !== substr($addr, 0, $bytes)) {
+        return false;
     }
-    if (!empty($_SERVER['REMOTE_ADDR'])) {
-        $candidates[] = (string) $_SERVER['REMOTE_ADDR'];
+    $rest = $bits % 8;
+    if ($rest === 0) {
+        return true;
     }
-    foreach ($candidates as $ip) {
-        if (filter_var($ip, FILTER_VALIDATE_IP)) {
-            return $ip;
+    $mask = (0xFF << (8 - $rest)) & 0xFF;
+    return (ord($net[$bytes]) & $mask) === (ord($addr[$bytes]) & $mask);
+}
+
+function ip_in_any(string $ip, array $cidrs): bool {
+    foreach ($cidrs as $c) {
+        if ($c !== '' && ip_in_cidr($ip, $c)) {
+            return true;
         }
     }
-    return 'none';
+    return false;
+}
+
+function cloudflare_ranges(): array {
+    $file = __DIR__ . '/cf_ips.txt';
+    if (is_readable($file)) {
+        $list = array_values(array_filter(array_map('trim', (array) file($file)),
+            static function ($l) { return $l !== '' && $l[0] !== '#'; }));
+        if ($list) {
+            return $list;
+        }
+    }
+    return CLOUDFLARE_RANGES;
+}
+
+/** The client's address from $server ($_SERVER), believing a forwarding header only from the hop that sets it. */
+function client_ip_from(array $server, ?array $cf = null): string {
+    $remote = (string) ($server['REMOTE_ADDR'] ?? '');
+    if (!filter_var($remote, FILTER_VALIDATE_IP)) {
+        return 'none';
+    }
+    if (ip_in_any($remote, $cf ?? cloudflare_ranges())) {
+        $c = trim((string) ($server['HTTP_CF_CONNECTING_IP'] ?? ''));
+        if (filter_var($c, FILTER_VALIDATE_IP)) {
+            return $c;
+        }
+    }
+    if (ip_in_any($remote, TRUSTED_PROXIES)) {
+        // The last entry is the one our own proxy appended: what it saw.
+        $parts = array_map('trim', explode(',', (string) ($server['HTTP_X_FORWARDED_FOR'] ?? '')));
+        $last = end($parts);
+        if (is_string($last) && filter_var($last, FILTER_VALIDATE_IP)) {
+            return $last;
+        }
+    }
+    return $remote;
+}
+
+function client_ip(): string {
+    return client_ip_from($_SERVER);
 }
 
 // Normalize an IP to a "source" key: IPv4 -> /24, IPv6 -> /64. This tolerates
